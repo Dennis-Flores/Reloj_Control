@@ -1,6 +1,1 @@
 face_recognition_models/
-__pycache__/
-*.pyc
-*.db
-*.pkl
-log_capturas.txt
