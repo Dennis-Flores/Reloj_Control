@@ -36,13 +36,14 @@ def construir_edicion(frame_padre, on_actualizacion=None):
     cont_rut_buscar = ctk.CTkFrame(contenedor, fg_color="transparent")
     cont_rut_buscar.grid(row=0, column=0, columnspan=2, pady=10)
 
-    fila_busqueda = ctk.CTkFrame(cont_rut_buscar, fg_color="transparent")
-    fila_busqueda.pack(side="top", pady=(0, 5))
-
-        # Cargar nombres y diccionario
+    # Cargar nombres y diccionario
     lista_nombres, dict_nombre_rut = cargar_nombres_ruts()
 
-    combo_nombre = ctk.CTkComboBox(fila_busqueda, values=lista_nombres, width=250)
+    # === Fila de búsqueda por nombre (ComboBox, Buscar Nombre, Limpiar) ===
+    fila_nombres = ctk.CTkFrame(cont_rut_buscar, fg_color="transparent")
+    fila_nombres.pack(side="top", pady=(0, 5))
+
+    combo_nombre = ctk.CTkComboBox(fila_nombres, values=lista_nombres, width=250)
     combo_nombre.set("Buscar por Nombre")
     combo_nombre.pack(side="left", padx=(0, 5))
 
@@ -56,8 +57,6 @@ def construir_edicion(frame_padre, on_actualizacion=None):
 
     combo_nombre.bind("<FocusIn>", limpiar_placeholder)
     combo_nombre.bind("<FocusOut>", restaurar_placeholder)
-
-
 
     # Autocompletado dinámico para el ComboBox de nombres
     def autocompletar_nombres(event):
@@ -118,29 +117,15 @@ def construir_edicion(frame_padre, on_actualizacion=None):
 
         threading.Thread(target=tarea, daemon=True).start()
 
-    
-    btn_buscar = ctk.CTkButton(fila_busqueda, text="Buscar Usuario", command=cargar_usuario)
-    btn_buscar.pack(side="left", padx=5)
-
     def cargar_por_nombre():
         nombre = combo_nombre.get()
         rut = dict_nombre_rut.get(nombre, "")
         if rut:
             entry_rut_buscar.delete(0, 'end')
             entry_rut_buscar.insert(0, rut)
-            cargar_usuario()  # Ya tienes la función, solo la llamas
+            cargar_usuario()
         else:
             label_estado.configure(text="⚠️ Selecciona un nombre válido", text_color="orange")
-
-    btn_buscar_nombre = ctk.CTkButton(fila_busqueda, text="Buscar Nombre", command=cargar_por_nombre)
-    btn_buscar_nombre.pack(side="left", padx=5)
-
-    # También puedes permitir buscar con ENTER en el ComboBox
-    combo_nombre.bind("<Return>", lambda event: cargar_por_nombre())
-
-    entry_rut_buscar = ctk.CTkEntry(cont_rut_buscar, placeholder_text="Ingresa RUT del funcionario a buscar", width=250)
-    entry_rut_buscar.pack(side="left", padx=(0, 5))
-    entry_rut_buscar.bind("<Return>", lambda event: cargar_usuario())
 
     def limpiar_todo():
         entry_rut_buscar.delete(0, 'end')
@@ -156,10 +141,30 @@ def construir_edicion(frame_padre, on_actualizacion=None):
             ent.delete(0, 'end')
             sal.delete(0, 'end')
         label_estado.configure(text="")
-        label_verificacion.configure(text="Verificación facial: ---", text_color="white")
+        label_verificacion.configure(text="Verificación facial: ---", text_color="white")   
 
-    btn_limpiar = ctk.CTkButton(fila_busqueda, text="🧹 Limpiar Formulario", fg_color="gray", width=40, command=limpiar_todo)
+
+    btn_buscar_nombre = ctk.CTkButton(fila_nombres, text="Buscar por Nombre", command=cargar_por_nombre)
+    btn_buscar_nombre.pack(side="left", padx=5)
+
+    btn_limpiar = ctk.CTkButton(fila_nombres, text="🧹 Limpiar Formulario", fg_color="gray", width=40, command=limpiar_todo)
     btn_limpiar.pack(side="left", padx=5)
+
+    combo_nombre.bind("<Return>", lambda event: cargar_por_nombre())
+
+    # === Fila de búsqueda por RUT (Entry, Buscar Usuario) ===
+    fila_rut = ctk.CTkFrame(cont_rut_buscar, fg_color="transparent")
+    fila_rut.pack(side="left", pady=(0, 5))
+
+    entry_rut_buscar = ctk.CTkEntry(fila_rut, placeholder_text="Ingresa RUT del funcionario a buscar", width=250,)
+    entry_rut_buscar.pack(side="left", padx=(0, 5))
+    entry_rut_buscar.bind("<Return>", lambda event: cargar_usuario())
+
+    btn_buscar = ctk.CTkButton(fila_rut, text="Buscar por RUT", command=cargar_usuario)
+    btn_buscar.pack(side="left", padx=5)
+
+
+    
 
 
  
