@@ -3,6 +3,7 @@ from db import crear_bd
 import sqlite3
 import tkinter as tk
 from tkinter import messagebox
+from panel_avanzado import construir_panel_avanzado
 
 from cambio_clave_admin import abrir_cambio_clave
 from dia_administrativo import construir_dia_administrativo
@@ -103,14 +104,24 @@ btn_editar = ctk.CTkButton(menu, text="Editar/Eliminar Usuario", command=lambda:
 btn_dia_admin = ctk.CTkButton(menu, text="Días Administrativos/Permisos", command=lambda: [limpiar_frame(), construir_dia_administrativo(frame_contenedor), resaltar_boton_activo("diaadmin")])
 botones_menu["diaadmin"] = btn_dia_admin
 
+btn_clave = ctk.CTkButton(menu, text="Cambiar Clave Administrador", command=abrir_cambio_clave)
+btn_clave.pack_forget()
+
+btn_panel_avanzado = ctk.CTkButton(menu, text="Panel Avanzado", command=lambda: [limpiar_frame(), construir_panel_avanzado(frame_contenedor), resaltar_boton_activo("panelavanzado")])
+botones_menu["panelavanzado"] = btn_panel_avanzado
+btn_panel_avanzado.pack_forget()  # Para mostrar solo al iniciar sesión admin
+for btn in [btn_registro, btn_reportes, btn_nomina, btn_editar, btn_dia_admin, btn_panel_avanzado, btn_clave]:
+    btn.pack_forget()
+
+
+
 btn_logout_admin = ctk.CTkButton(menu, text="Cerrar Sesión Admin", fg_color="gray", command=lambda: cerrar_sesion_admin())
 btn_logout_admin.pack_forget()
 
 for btn in [btn_registro, btn_reportes, btn_nomina, btn_editar, btn_dia_admin]:
     btn.pack_forget()
 
-btn_clave = ctk.CTkButton(menu, text="Cambiar Clave Administrador", command=abrir_cambio_clave)
-btn_clave.pack_forget()
+
 
 def mostrar_opciones_admin():
     btn_registro.pack(side="left", padx=5)
@@ -126,6 +137,7 @@ def mostrar_opciones_admin():
     botones_menu["editar"] = btn_editar
 
     btn_dia_admin.pack(side="left", padx=5)
+    btn_panel_avanzado.pack(side="left", padx=5)
     btn_clave.pack(side="left", padx=5)
     btn_logout_admin.pack(side="right", padx=5)
 
