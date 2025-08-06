@@ -352,25 +352,29 @@ def construir_reportes(frame_padre):
                 return
 
         cursor.execute("""
-            SELECT fecha, hora, tipo, observacion FROM registros
+            SELECT fecha, hora_ingreso, hora_salida, observacion FROM registros
             WHERE rut = ? AND fecha BETWEEN ? AND ?
-            ORDER BY fecha, hora
+            ORDER BY fecha
         """, (rut, desde_dt.strftime('%Y-%m-%d'), hasta_dt.strftime('%Y-%m-%d')))
         registros = cursor.fetchall()
 
-        registros_por_dia.clear()
-        for fecha, hora, tipo, observacion in registros:
-            if fecha not in registros_por_dia:
-                registros_por_dia[fecha] = {
-                    "ingreso": None, "salida": None,
-                    "obs_ingreso": "", "obs_salida": "",
-                    "es_admin": False
-                }
-            registros_por_dia[fecha][tipo] = hora
-            if tipo == "ingreso":
-                registros_por_dia[fecha]["obs_ingreso"] = observacion
-            elif tipo == "salida":
-                registros_por_dia[fecha]["obs_salida"] = observacion
+        for fecha, hora_ingreso, hora_salida, observacion in registros:
+            registros_por_dia[fecha] = {
+                "ingreso": hora_ingreso if hora_ingreso else "--",
+                "salida": hora_salida if hora_salida else "--",
+                "obs_ingreso": observacion if hora_ingreso else "",
+                "obs_salida": observacion if hora_salida else "",
+                "motivo": ""
+            }
+        else:
+                # Si por alguna razón hay más de un registro por día (no debería), solo actualiza si el campo está vacío
+                if not registros_por_dia[fecha]["ingreso"] and hora_ingreso:
+                    registros_por_dia[fecha]["ingreso"] = hora_ingreso
+                    registros_por_dia[fecha]["obs_ingreso"] = observacion
+                if not registros_por_dia[fecha]["salida"] and hora_salida:
+                    registros_por_dia[fecha]["salida"] = hora_salida
+                    registros_por_dia[fecha]["obs_salida"] = observacion    
+
 
         agregar_dias_administrativos(registros_por_dia, rut, desde_dt, hasta_dt)
         conexion.close()
@@ -403,18 +407,27 @@ def construir_reportes(frame_padre):
                 salida = registros_por_dia[fecha].get("salida", "--")
                 obs_ingreso = registros_por_dia[fecha].get("obs_ingreso", "")
                 obs_salida = registros_por_dia[fecha].get("obs_salida", "")
-                trabajado = registros_por_dia[fecha].get("trabajado", "Incompleto")
                 es_admin = registros_por_dia[fecha].get("es_admin", False)
 
+                # Valor por defecto:
+                trabajado = registros_por_dia[fecha].get("trabajado", "Incompleto")
+
+                # Si ambos existen y no es admin, calcula las horas:
                 if not es_admin and ingreso not in (None, "--") and salida not in (None, "--"):
-                    t1 = datetime.strptime(ingreso, "%H:%M:%S")
-                    t2 = datetime.strptime(salida, "%H:%M:%S")
-                    duracion = t2 - t1
-                    minutos = duracion.total_seconds() // 60
-                    h, m = divmod(minutos, 60)
-                    trabajado = f"{int(h)}h {int(m)}min"
+                    try:
+                        t1 = datetime.strptime(ingreso, "%H:%M:%S")
+                        t2 = datetime.strptime(salida, "%H:%M:%S")
+                        duracion = t2 - t1
+                        minutos = duracion.total_seconds() // 60
+                        h, m = divmod(minutos, 60)
+                        trabajado = f"{int(h)}h {int(m)}min"
+                        registros_por_dia[fecha]["trabajado"] = trabajado
+                        total_minutos += minutos
+                    except Exception as e:
+                        trabajado = "Incompleto"
+                elif ingreso in (None, "--") or salida in (None, "--"):
+                    trabajado = "Incompleto"
                     registros_por_dia[fecha]["trabajado"] = trabajado
-                    total_minutos += minutos
 
                 fecha_legible = datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y")
                 fila_datos = [

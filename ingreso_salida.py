@@ -154,27 +154,42 @@ def construir_ingreso_salida(frame_padre):
     def actualizar_estado_botones(rut):
         conexion = sqlite3.connect("reloj_control.db")
         cursor = conexion.cursor()
-
-        # Verifica registros solo para la fecha actual sin importar el formato exacto
+        # Busca registro solo para el día de hoy
         cursor.execute("""
-            SELECT tipo FROM registros 
+            SELECT hora_ingreso, hora_salida FROM registros
             WHERE rut = ? AND DATE(fecha) = DATE('now')
         """, (rut,))
-        tipos = [r[0].strip().lower() for r in cursor.fetchall()]
+        resultado = cursor.fetchone()
         conexion.close()
 
-        # Ocultar botones al iniciar
+        # Oculta ambos botones por defecto
         boton_ingreso.pack_forget()
         boton_salida.pack_forget()
 
-        if "ingreso" not in tipos:
+        if not resultado:
+            # No hay registro hoy: solo puede ingresar
             label_estado.configure(text="🔷 Puedes registrar el ingreso.", text_color="blue")
             boton_ingreso.pack(pady=10)
-        elif "ingreso" in tipos and "salida" not in tipos:
-            label_estado.configure(text="✅ Ingreso realizado Correctamente. Ahora puedes registrar la salida.", text_color="yellow")
-            boton_salida.pack(pady=10)
         else:
-            label_estado.configure(text="✔️ Ya se registró ingreso y salida hoy, que tengas un excelente Descanso.", text_color="green")
+            hora_ingreso, hora_salida = resultado
+            if not hora_ingreso:
+                # Registro creado pero aún no ha ingresado (caso muy raro)
+                label_estado.configure(text="🔷 Puedes registrar el ingreso.", text_color="blue")
+                boton_ingreso.pack(pady=10)
+            elif not hora_salida:
+                # Ya registró ingreso, pero aún no salida
+                label_estado.configure(
+                    text="✅ Ingreso realizado correctamente. Ahora puedes registrar la salida.",
+                    text_color="yellow"
+                )
+                boton_salida.pack(pady=10)
+            else:
+                # Ya marcó ingreso y salida
+                label_estado.configure(
+                    text="✔️ Ya se registró ingreso y salida hoy. Que tengas un excelente descanso.",
+                    text_color="green"
+                )
+
 
 
     def parse_hora(hora_str):
@@ -208,17 +223,6 @@ def construir_ingreso_salida(frame_padre):
         conexion = sqlite3.connect("reloj_control.db")
         cursor = conexion.cursor()
 
-        # Validar si ya existe un registro del tipo
-        cursor.execute("""
-            SELECT COUNT(*) FROM registros 
-            WHERE rut = ? AND tipo = ? AND DATE(fecha) = DATE('now')
-        """, (rut, tipo.lower()))
-        existe = cursor.fetchone()[0]
-        if existe > 0:
-            label_estado.configure(text=f"⚠️ Ya registraste un {tipo} hoy.", text_color="orange")
-            conexion.close()
-            return
-
         # Obtener todos los bloques del día (mañana, tarde, etc.)
         cursor.execute("""
             SELECT hora_entrada, hora_salida FROM horarios
@@ -227,20 +231,72 @@ def construir_ingreso_salida(frame_padre):
         bloques = cursor.fetchall()
 
         def registrar_final(observacion=""):
-            cursor.execute(
-                "INSERT INTO registros (rut, nombre, fecha, hora, tipo, observacion) VALUES (?, ?, ?, ?, ?, ?)",
-                (rut, nombre, fecha, hora_actual, tipo.lower(), observacion)
-            )
-            conexion.commit()
-            conexion.close()
-            label_estado.configure(
-                text=f"{tipo.capitalize()} registrado correctamente ✅\nLimpieza automática en 60 seg...",
-                text_color="green"
-            )
-            boton_ingreso.pack_forget()
-            boton_salida.pack_forget()
-            actualizar_estado_botones(rut)
-            frame.after(60000, limpiar_campos)
+            if tipo == "ingreso":
+                # ... (ya lo tienes correcto)
+                cursor.execute("""
+                    SELECT hora_ingreso FROM registros WHERE rut = ? AND DATE(fecha) = DATE('now')
+                """, (rut,))
+                resultado = cursor.fetchone()
+                if resultado:
+                    if resultado[0]:
+                        label_estado.configure(text="⚠️ Ya registraste un ingreso hoy.", text_color="orange")
+                        conexion.close()
+                        return
+                    else:
+                        cursor.execute("""
+                            UPDATE registros SET hora_ingreso = ?, observacion = ? WHERE rut = ? AND DATE(fecha) = DATE('now')
+                        """, (hora_actual, observacion, rut))
+                        conexion.commit()
+                else:
+                    cursor.execute("""
+                        INSERT INTO registros (rut, nombre, fecha, hora_ingreso, hora_salida, observacion)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (rut, nombre, fecha, hora_actual, None, observacion))
+                    conexion.commit()
+                conexion.close()
+                label_estado.configure(
+                    text=f"Ingreso registrado correctamente ✅\nLimpieza automática en 60 seg...",
+                    text_color="green"
+                )
+                boton_ingreso.pack_forget()
+                boton_salida.pack_forget()
+                actualizar_estado_botones(rut)
+                frame.after(60000, limpiar_campos)
+
+            elif tipo == "salida":
+                # --- NUEVO FLUJO DE SALIDA ---
+                cursor.execute("""
+                    SELECT hora_salida FROM registros WHERE rut = ? AND DATE(fecha) = DATE('now')
+                """, (rut,))
+                resultado = cursor.fetchone()
+                if resultado:
+                    if resultado[0]:
+                        label_estado.configure(text="⚠️ Ya registraste una salida hoy.", text_color="orange")
+                        conexion.close()
+                        return
+                    else:
+                        cursor.execute("""
+                            UPDATE registros SET hora_salida = ?, observacion = ? WHERE rut = ? AND DATE(fecha) = DATE('now')
+                        """, (hora_actual, observacion, rut))
+                        conexion.commit()
+                else:
+                    # Si no hay fila de ingreso, permite crear la fila SOLO con salida (flujo de emergencia)
+                    cursor.execute("""
+                        INSERT INTO registros (rut, nombre, fecha, hora_ingreso, hora_salida, observacion)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                    """, (rut, nombre, fecha, None, hora_actual, observacion))
+                    conexion.commit()
+                conexion.close()
+                label_estado.configure(
+                    text=f"Salida registrada correctamente ✅\nLimpieza automática en 60 seg...",
+                    text_color="green"
+                )
+                boton_ingreso.pack_forget()
+                boton_salida.pack_forget()
+                actualizar_estado_botones(rut)
+                frame.after(60000, limpiar_campos)
+
+
 
         def pedir_observacion(motivo):
             obs_win = tk.Toplevel()
@@ -445,6 +501,8 @@ def construir_ingreso_salida(frame_padre):
             return
 
         buscar_rut()
+
+    
 
     frame = ctk.CTkFrame(frame_padre)
     frame.pack(fill="both", expand=True)
