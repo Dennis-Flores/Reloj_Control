@@ -3,17 +3,36 @@ import sqlite3
 from tkinter import messagebox
 import datetime
 
-
 def cerrar_dia_para_todos(observacion):
     import datetime
     try:
         conexion = sqlite3.connect("reloj_control.db")
         cursor = conexion.cursor()
+
+        # Buscar todos los ingresos sin salida registrada HOY usando la nueva lógica y columna hora_ingreso
         cursor.execute("""
-            SELECT id, rut, fecha, hora FROM registros 
-            WHERE DATE(fecha) = DATE('now') AND tipo = 'ingreso'
+            SELECT i.id, i.rut, i.fecha, i.hora_ingreso
+            FROM registros i
+            WHERE i.tipo = 'ingreso'
+              AND i.fecha = DATE('now')
+              AND NOT EXISTS (
+                SELECT 1 FROM registros s
+                WHERE s.rut = i.rut
+                  AND s.tipo = 'salida'
+                  AND s.fecha = i.fecha
+            )
         """)
         ingresos = cursor.fetchall()
+        print("DEBUG ingresos pendientes:", ingresos)
+
+        if not ingresos:
+            messagebox.showinfo(
+                "Nada que cerrar",
+                "No hay ingresos pendientes para cerrar hoy."
+            )
+            conexion.close()
+            return
+
         for reg_id, rut, fecha, hora_ingreso in ingresos:
             fecha_obj = datetime.datetime.strptime(fecha, "%Y-%m-%d")
             dias = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
@@ -52,11 +71,11 @@ def cerrar_dia_para_todos(observacion):
 
             hora_salida_programada = hora_salida_programada[:5]
 
+            # Insertar el registro de salida
             cursor.execute("""
-                UPDATE registros
-                SET hora = ?, tipo = 'salida', nombre = 'Dirección', observacion = ?
-                WHERE id = ?
-            """, (hora_salida_programada, observacion, reg_id))
+                INSERT INTO registros (rut, fecha, hora, tipo, nombre, observacion)
+                VALUES (?, ?, ?, 'salida', 'Dirección', ?)
+            """, (rut, fecha, hora_salida_programada, observacion))
 
         conexion.commit()
         conexion.close()
@@ -66,6 +85,7 @@ def cerrar_dia_para_todos(observacion):
         )
     except Exception as e:
         messagebox.showerror("Error", f"Error al cerrar jornada:\n{e}")
+
 
 
 

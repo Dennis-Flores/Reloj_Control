@@ -10,6 +10,14 @@ import time
 import math
 
 
+def parse_hora_flexible(hora_str):
+    """Devuelve un objeto datetime.time para HH:MM o HH:MM:SS."""
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(hora_str.strip(), fmt)
+        except ValueError:
+            continue
+    return None
 
 def construir_reportes(frame_padre):
     registros_por_dia = {}
@@ -214,18 +222,17 @@ def construir_reportes(frame_padre):
 
             # CALCULAR HORAS TRABAJADAS SOLO SI HAY INGRESO Y SALIDA
             if ingreso not in (None, "--") and salida not in (None, "--"):
-                try:
-                    t1 = datetime.strptime(ingreso, "%H:%M:%S")
-                    t2 = datetime.strptime(salida, "%H:%M:%S")
-                    duracion = t2 - t1
+                t1 = parse_hora_flexible(ingreso)
+                t2 = parse_hora_flexible(salida)
+                if t1 and t2:
+                    duracion = (t2 - t1)
                     minutos = int(duracion.total_seconds() // 60)
                     h, m = divmod(minutos, 60)
                     trabajado_dia = f"{int(h):02}:{int(m):02}"
                     total_minutos += minutos
-
-                    # (estado_dia se ajusta abajo si corresponde)
-                except:
+                else:
                     trabajado_dia = "--:--"
+
 
             # DÍA OK o INCOMPLETO
             if ingreso not in (None, "--") and salida not in (None, "--"):
@@ -352,10 +359,12 @@ def construir_reportes(frame_padre):
                 return
 
         cursor.execute("""
-            SELECT fecha, hora_ingreso, hora_salida, observacion FROM registros
+            SELECT fecha, hora_ingreso, hora_salida, observacion
+            FROM registros
             WHERE rut = ? AND fecha BETWEEN ? AND ?
             ORDER BY fecha
         """, (rut, desde_dt.strftime('%Y-%m-%d'), hasta_dt.strftime('%Y-%m-%d')))
+
         registros = cursor.fetchall()
 
         for fecha, hora_ingreso, hora_salida, observacion in registros:
@@ -414,17 +423,19 @@ def construir_reportes(frame_padre):
 
                 # Si ambos existen y no es admin, calcula las horas:
                 if not es_admin and ingreso not in (None, "--") and salida not in (None, "--"):
-                    try:
-                        t1 = datetime.strptime(ingreso, "%H:%M:%S")
-                        t2 = datetime.strptime(salida, "%H:%M:%S")
-                        duracion = t2 - t1
+                    t1 = parse_hora_flexible(ingreso)
+                    t2 = parse_hora_flexible(salida)
+                    if t1 and t2:
+                        duracion = (t2 - t1)
                         minutos = duracion.total_seconds() // 60
                         h, m = divmod(minutos, 60)
                         trabajado = f"{int(h)}h {int(m)}min"
                         registros_por_dia[fecha]["trabajado"] = trabajado
                         total_minutos += minutos
-                    except Exception as e:
+                    else:
                         trabajado = "Incompleto"
+                        registros_por_dia[fecha]["trabajado"] = trabajado
+
                 elif ingreso in (None, "--") or salida in (None, "--"):
                     trabajado = "Incompleto"
                     registros_por_dia[fecha]["trabajado"] = trabajado
@@ -507,20 +518,21 @@ def construir_reportes(frame_padre):
 
                 # Obtener registros normales
                 cursor.execute("""
-                    SELECT fecha, hora, tipo, observacion FROM registros
-                    WHERE rut = ? AND fecha BETWEEN ? AND ?
-                    ORDER BY fecha, hora
-                """, (rut, desde_dt.strftime('%Y-%m-%d'), hasta_dt.strftime('%Y-%m-%d')))
-                registros = cursor.fetchall()
+                SELECT fecha, hora, tipo, observacion FROM registros
+                WHERE rut = ? AND fecha BETWEEN ? AND ?
+                ORDER BY fecha, hora
+            """, (rut, desde_dt.strftime('%Y-%m-%d'), hasta_dt.strftime('%Y-%m-%d')))
+            registros = cursor.fetchall()
 
-                for fecha, hora, tipo, obs in registros:
-                    if fecha not in registros_por_dia:
-                        registros_por_dia[fecha] = {"ingreso": None, "salida": None, "motivo": ""}
-                    registros_por_dia[fecha][tipo] = hora
-                    if tipo == "ingreso":
-                        registros_por_dia[fecha]["obs_ingreso"] = obs
-                    elif tipo == "salida":
-                        registros_por_dia[fecha]["obs_salida"] = obs
+            for fecha, hora, tipo, obs in registros:
+                if fecha not in registros_por_dia:
+                    registros_por_dia[fecha] = {"ingreso": None, "salida": None, "motivo": ""}
+                registros_por_dia[fecha][tipo] = hora
+                if tipo == "ingreso":
+                    registros_por_dia[fecha]["obs_ingreso"] = obs
+                elif tipo == "salida":
+                    registros_por_dia[fecha]["obs_salida"] = obs
+
 
                 # Agregar días administrativos con motivo
                 cursor.execute("""
@@ -548,8 +560,8 @@ def construir_reportes(frame_padre):
                     # Calcular horas trabajadas
                     if ingreso not in (None, "--") and salida not in (None, "--"):
                         try:
-                            t1 = datetime.strptime(ingreso, "%H:%M:%S")
-                            t2 = datetime.strptime(salida, "%H:%M:%S")
+                            t1 = datetime.strptime(ingreso, "%H:%M:%S") if len(ingreso) > 5 else datetime.strptime(ingreso, "%H:%M")
+                            t2 = datetime.strptime(salida, "%H:%M:%S") if len(salida) > 5 else datetime.strptime(salida, "%H:%M")
                             duracion = t2 - t1
                             minutos = int(duracion.total_seconds() // 60)
                             h, m = divmod(minutos, 60)
