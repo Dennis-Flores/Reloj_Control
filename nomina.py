@@ -1,155 +1,187 @@
 import customtkinter as ctk
 import sqlite3
 
+# mantiene qué RUT está expandido aunque se filtre
 expandido_por_rut = {}
 
 def construir_nomina(frame_padre):
+    # ---------- ROOT ----------
     frame = ctk.CTkFrame(frame_padre)
     frame.pack(fill="both", expand=True)
 
     ctk.CTkLabel(frame, text="Nómina de Funcionarios", font=("Arial", 16)).pack(pady=10)
 
+    # ---------- BUSCADOR ----------
     contenedor_busqueda = ctk.CTkFrame(frame, fg_color="transparent")
     contenedor_busqueda.pack(pady=5, padx=20, anchor="w")
 
-    icono = ctk.CTkLabel(contenedor_busqueda, text="🔍", font=("Arial", 18))
-    icono.pack(side="left", padx=(0, 5))
-
+    ctk.CTkLabel(contenedor_busqueda, text="🔍", font=("Arial", 18)).pack(side="left", padx=(0, 5))
     entry_buscar = ctk.CTkEntry(contenedor_busqueda, placeholder_text="Buscar por nombre o RUT", width=300)
     entry_buscar.pack(side="left")
 
     def limpiar_busqueda():
         entry_buscar.delete(0, 'end')
-        actualizar_tabla()
+        actualizar_lista()
 
-    boton_limpiar = ctk.CTkButton(contenedor_busqueda, text="Limpiar", width=40, command=limpiar_busqueda)
-    boton_limpiar.pack(side="left", padx=(5, 0))
+    ctk.CTkButton(contenedor_busqueda, text="Limpiar", width=60, command=limpiar_busqueda).pack(side="left", padx=(6, 0))
 
-    tabla_scroll = ctk.CTkScrollableFrame(frame)
-    tabla_scroll.pack(fill="both", expand=True, padx=20, pady=10)
+    # ---------- ENCABEZADOS ----------
+    hdr = ctk.CTkFrame(frame)
+    hdr.pack(fill="x", padx=20, pady=(10, 2))
+    cols = ["", "Nombre", "RUT", "Profesión", "Correo", "Cumpleaños"]
+    widths = [32, 220, 130, 160, 220, 110]
+    for i, (t, w) in enumerate(zip(cols, widths)):
+        ctk.CTkLabel(hdr, text=t, font=("Arial", 13, "bold")).pack(side="left", padx=(6 if i else 0, 6))
+        hdr.pack_propagate(False)
 
-    encabezados = ["Nombre", "RUT", "Profesión", "Correo", "Cumpleaños"]
-    for col, titulo in enumerate(encabezados):
-        ctk.CTkLabel(tabla_scroll, text=titulo, font=("Arial", 13, "bold")).grid(row=0, column=col, padx=10, pady=5)
+    # ---------- LISTA SCROLLABLE ----------
+    lista = ctk.CTkScrollableFrame(frame)
+    lista.pack(fill="both", expand=True, padx=20, pady=(0, 16))
 
-    def mostrar_u_ocultar_horario(rut, fila):
-        global expandido_por_rut
-        clave = (rut, fila)
-
-        fila_widgets = [w for w in tabla_scroll.winfo_children() if w.grid_info().get("row") == fila and w.grid_info().get("column") == 0]
-        if fila_widgets:
-            label = fila_widgets[0]
-            texto_actual = label.cget("text")
-            nueva_flecha = "🔽" if clave not in expandido_por_rut else "▶"
-            label.configure(text=f"{nueva_flecha} {texto_actual[2:]}")
-
-        if clave in expandido_por_rut:
-            for widget in expandido_por_rut[clave]:
-                widget.destroy()
-            del expandido_por_rut[clave]
-        else:
-            conexion = sqlite3.connect("reloj_control.db")
-            cursor = conexion.cursor()
-            cursor.execute("SELECT dia, hora_entrada, hora_salida FROM horarios WHERE rut = ? ORDER BY dia, hora_entrada", (rut,))
-            horarios = cursor.fetchall()
-            conexion.close()
-
-            widgets = []
-            dias_orden = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes']
-            bloques = {
-                'Mañana': {dia: [] for dia in dias_orden},
-                'Tarde': {dia: [] for dia in dias_orden},
-                'Nocturno': {dia: [] for dia in dias_orden},
-            }
-            for dia, entrada, salida in horarios:
-                if dia in dias_orden:
-                    entrada = entrada or "-"
-                    salida = salida or "-"
-                    hora_ent = int(entrada.split(':')[0]) if entrada != "-" else 0
-
-                    if hora_ent < 12:
-                        bloques['Mañana'][dia].append((entrada, salida))
-                    elif hora_ent < 18:
-                        bloques['Tarde'][dia].append((entrada, salida))
-                    else:
-                        bloques['Nocturno'][dia].append((entrada, salida))
-
-            encabezados_bloques = ["☀️ Mañana", "🌇 Tarde", "🌙 Nocturno"]
-            fila_base = fila + 1
-
-            for col_bloque, bloque_nombre in enumerate(bloques.keys(), start=1):
-                titulo = ctk.CTkLabel(tabla_scroll, text=encabezados_bloques[col_bloque - 1], font=("Arial", 12, "bold"), text_color="gray")
-                titulo.grid(row=fila_base, column=col_bloque + 1, padx=5, sticky='w')
-                widgets.append(titulo)
-
-            for i, dia in enumerate(dias_orden):
-                lbl_dia = ctk.CTkLabel(tabla_scroll, text=dia + ":", text_color="gray")
-                lbl_dia.grid(row=fila_base + 1 + i, column=1, sticky='w', padx=10)
-                widgets.append(lbl_dia)
-
-                for col_bloque, bloque_nombre in enumerate(bloques.keys(), start=1):
-                    horarios_dia = bloques[bloque_nombre][dia]
-                    if horarios_dia:
-                        texto = "\n".join([f"{e} a {s}" for e, s in horarios_dia])
-                    else:
-                        texto = "-"
-                    lbl = ctk.CTkLabel(tabla_scroll, text=texto, text_color="gray", justify="left")
-                    lbl.grid(row=fila_base + 1 + i, column=col_bloque + 1, sticky='w', padx=5)
-                    widgets.append(lbl)
-
-            expandido_por_rut[clave] = widgets
-
-            total_filas_insertadas = len(dias_orden) + 2
-            for w in tabla_scroll.winfo_children():
-                info = w.grid_info()
-                fila_actual = info.get("row")
-                if fila_actual and fila_actual > fila:
-                    w.grid(row=fila_actual + total_filas_insertadas)
-
-    def actualizar_tabla(filtro=""):
-        global expandido_por_rut
-        expandido_por_rut.clear()
-        for widget in tabla_scroll.winfo_children():
-            info = widget.grid_info()
-            if int(info['row']) > 0:
-                widget.destroy()
-
-        conexion = sqlite3.connect("reloj_control.db")
-        cursor = conexion.cursor()
-
-        if filtro:
-            filtro = f"%{filtro.lower()}%"
-            cursor.execute("""
+    # ---------- HELPERS DB ----------
+    def _fetch_nomina(filtro_txt=""):
+        conn = sqlite3.connect("reloj_control.db")
+        cur = conn.cursor()
+        if filtro_txt:
+            f = f"%{filtro_txt.lower()}%"
+            cur.execute("""
                 SELECT nombre, apellido, rut, profesion, correo, cumpleanos 
                 FROM trabajadores 
                 WHERE lower(nombre || ' ' || apellido || rut) LIKE ?
-                ORDER BY apellido
-            """, (filtro,))
+                ORDER BY apellido, nombre
+            """, (f,))
         else:
-            cursor.execute("SELECT nombre, apellido, rut, profesion, correo, cumpleanos FROM trabajadores ORDER BY apellido")
+            cur.execute("""
+                SELECT nombre, apellido, rut, profesion, correo, cumpleanos 
+                FROM trabajadores 
+                ORDER BY apellido, nombre
+            """)
+        rows = cur.fetchall()
+        conn.close()
+        return rows
 
-        datos = cursor.fetchall()
-        conexion.close()
+    def _fetch_horarios(rut):
+        conn = sqlite3.connect("reloj_control.db")
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT dia, hora_entrada, hora_salida
+            FROM horarios
+            WHERE rut = ?
+            ORDER BY dia, hora_entrada
+        """, (rut,))
+        horarios = cur.fetchall()
+        conn.close()
+        return horarios
 
-        if not datos:
-            ctk.CTkLabel(tabla_scroll, text="No se encontraron resultados", text_color="orange").grid(row=1, column=0, columnspan=5, pady=10)
-        else:
-            fila_actual = 1
-            for trabajador in datos:
-                nombre = f"{trabajador[0]} {trabajador[1]}"
-                celdas = [nombre, trabajador[2], trabajador[3], trabajador[4], trabajador[5]]
-                for col, dato in enumerate(celdas):
-                    icono_estado = "🔽" if (trabajador[2], fila_actual) in expandido_por_rut else "▶"
-                    if col == 0:
-                        label = ctk.CTkLabel(tabla_scroll, text=f"{icono_estado} {dato or '-'}", anchor='w', justify='left')
-                    elif col == 4:
-                        label = ctk.CTkLabel(tabla_scroll, text=dato or "-", anchor='w', justify='left')
+    # ---------- BUILDER DE FILA ----------
+    def build_row(datos):
+        nombre_completo = f"{datos[0]} {datos[1]}"
+        rut, profesion, correo, cumple = datos[2], datos[3] or "-", datos[4] or "-", datos[5] or "-"
+
+        # contenedor de un “bloque” de funcionario (header + details)
+        row = ctk.CTkFrame(lista, fg_color="transparent")
+        row.pack(fill="x", pady=2)
+
+        header = ctk.CTkFrame(row)
+        header.pack(fill="x")
+
+        # columna 0: toggle
+        is_expanded = expandido_por_rut.get(rut, False)
+        btn_toggle = ctk.CTkButton(header, text=("▼" if is_expanded else "▶"), width=28, height=28)
+        btn_toggle.pack(side="left", padx=4, pady=3)
+
+        # resto de columnas como labels (usamos pack para layout horizontal)
+        def _lbl(parent, text, width):
+            l = ctk.CTkLabel(parent, text=text, anchor="w")
+            f = ctk.CTkFrame(parent, width=width, height=28, fg_color="transparent")
+            f.pack_propagate(False)
+            l.pack(in_=f, fill="both", expand=True, padx=6)
+            f.pack(side="left")
+            return l
+
+        _lbl(header, nombre_completo or "-", 220)
+        _lbl(header, rut or "-", 130)
+        _lbl(header, profesion, 160)
+        _lbl(header, correo, 220)
+        _lbl(header, cumple, 110)
+
+        # detalles (accordion)
+        details = ctk.CTkFrame(row, fg_color="#1f2630", corner_radius=8)
+        details.pack(fill="x", padx=34, pady=(4, 8))
+        if not is_expanded:
+            details.pack_forget()
+
+        # función que arma/recarga la tabla de horarios
+        def populate_details():
+            for w in details.winfo_children():
+                w.destroy()
+
+            dias_orden = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes']
+            bloques = {'Mañana': {d: [] for d in dias_orden},
+                       'Tarde': {d: [] for d in dias_orden},
+                       'Nocturno': {d: [] for d in dias_orden}}
+
+            for dia, entrada, salida in _fetch_horarios(rut):
+                if dia in dias_orden:
+                    e = entrada or "-"
+                    s = salida or "-"
+                    try:
+                        h_ent = int(e.split(":")[0]) if e != "-" else 0
+                    except Exception:
+                        h_ent = 0
+                    if h_ent < 12:
+                        bloques['Mañana'][dia].append((e, s))
+                    elif h_ent < 18:
+                        bloques['Tarde'][dia].append((e, s))
                     else:
-                        label = ctk.CTkLabel(tabla_scroll, text=dato or "-", anchor='center')
-                    label.grid(row=fila_actual, column=col, padx=10, pady=2)
-                    if col == 0:
-                        label.bind("<Double-Button-1>", lambda e, rut=trabajador[2], fila=fila_actual: mostrar_u_ocultar_horario(rut, fila))
-                fila_actual += 1
+                        bloques['Nocturno'][dia].append((e, s))
 
-    entry_buscar.bind("<KeyRelease>", lambda event: actualizar_tabla(entry_buscar.get().strip()))
-    actualizar_tabla()
+            # encabezado de tarjetas
+            head = ctk.CTkFrame(details, fg_color="transparent")
+            head.pack(fill="x", pady=(8, 4))
+            ctk.CTkLabel(head, text=f"Horario de {nombre_completo}", font=("Arial", 13, "bold")).pack(side="left", padx=10)
+
+            grid = ctk.CTkFrame(details)
+            grid.pack(fill="x", padx=10, pady=(4, 10))
+
+            # títulos de columnas
+            for i, titulo in enumerate(["☀️ Mañana", "🌇 Tarde", "🌙 Nocturno"]):
+                ctk.CTkLabel(grid, text=titulo, font=("Arial", 12, "bold")).grid(row=0, column=i+1, padx=8, pady=4, sticky="w")
+
+            # filas por día
+            for r, dia in enumerate(dias_orden, start=1):
+                ctk.CTkLabel(grid, text=dia + ":", text_color="gray").grid(row=r, column=0, padx=8, pady=3, sticky="w")
+                for c, bloque in enumerate(["Mañana", "Tarde", "Nocturno"], start=1):
+                    tramos = bloques[bloque][dia]
+                    texto = "\n".join([f"{e} a {s}" for (e, s) in tramos]) if tramos else "-"
+                    ctk.CTkLabel(grid, text=texto, justify="left").grid(row=r, column=c, padx=8, pady=3, sticky="w")
+
+        # toggle handler
+        def toggle():
+            expanded = expandido_por_rut.get(rut, False)
+            if expanded:
+                details.pack_forget()
+                expandido_por_rut[rut] = False
+                btn_toggle.configure(text="▶")
+            else:
+                populate_details()
+                details.pack(fill="x", padx=34, pady=(4, 8))
+                expandido_por_rut[rut] = True
+                btn_toggle.configure(text="▼")
+
+        btn_toggle.configure(command=toggle)
+
+        # si viene expandido desde un filtro anterior, poblar
+        if is_expanded:
+            populate_details()
+
+    # ---------- REFRESH LIST ----------
+    def actualizar_lista():
+        for w in lista.winfo_children():
+            w.destroy()
+        filtro = (entry_buscar.get() or "").strip()
+        for row in _fetch_nomina(filtro):
+            build_row(row)
+
+    entry_buscar.bind("<KeyRelease>", lambda e: actualizar_lista())
+    actualizar_lista()
