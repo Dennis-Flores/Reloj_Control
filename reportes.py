@@ -1,6 +1,6 @@
 import customtkinter as ctk
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from tkcalendar import Calendar
 import tkinter as tk
 import pandas as pd
@@ -10,14 +10,101 @@ import time
 import math
 
 
+# ===================== UTILIDADES DE HORA =====================
+
 def parse_hora_flexible(hora_str):
-    """Devuelve un objeto datetime.time para HH:MM o HH:MM:SS."""
+    """Devuelve un datetime para HH:MM o HH:MM:SS. Retorna None si falla."""
+    if not hora_str:
+        return None
     for fmt in ("%H:%M:%S", "%H:%M"):
         try:
             return datetime.strptime(hora_str.strip(), fmt)
         except ValueError:
             continue
     return None
+
+
+def obtener_horario_del_dia(rut, fecha_dt):
+    """
+    Devuelve (hora_entrada, hora_salida) como strings del horario para ese día.
+    Toma el primer tramo como entrada y el último como salida si existen múltiples tramos.
+    """
+    if isinstance(fecha_dt, str):
+        fecha_dt = datetime.strptime(fecha_dt, "%Y-%m-%d")
+
+    nombre_dia = fecha_dt.strftime("%A")
+    dias_map = {
+        'Monday': 'lunes', 'Tuesday': 'martes', 'Wednesday': 'miércoles',
+        'Thursday': 'jueves', 'Friday': 'viernes', 'Saturday': 'sábado', 'Sunday': 'domingo'
+    }
+    dia = dias_map.get(nombre_dia, '').lower()
+
+    try:
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        cur.execute(
+            "SELECT hora_entrada, hora_salida FROM horarios WHERE rut = ? AND LOWER(dia) = ?",
+            (rut, dia)
+        )
+        filas = cur.fetchall()
+        con.close()
+        if not filas:
+            return (None, None)
+
+        he = filas[0][0].strip() if filas[0][0] else None
+        hs = filas[-1][1].strip() if filas[-1][1] else None
+        return (he, hs)
+    except Exception:
+        return (None, None)
+
+
+def obtener_horas_administrativo(rut, fecha_str, como_minutos=False):
+    """
+    Calcula el total de minutos (o texto 'Hh Mmin') del horario contratado para ese día.
+    Suma todos los tramos del día en tabla `horarios`.
+    """
+    try:
+        conexion = sqlite3.connect("reloj_control.db")
+        cursor = conexion.cursor()
+
+        if isinstance(fecha_str, str):
+            fecha_dt = datetime.strptime(fecha_str, "%Y-%m-%d")
+        else:
+            fecha_dt = fecha_str
+
+        nombre_dia = fecha_dt.strftime("%A")
+        dias_map = {
+            'Monday': 'lunes', 'Tuesday': 'martes', 'Wednesday': 'miércoles',
+            'Thursday': 'jueves', 'Friday': 'viernes', 'Saturday': 'sábado', 'Sunday': 'domingo'
+        }
+        dia = dias_map.get(nombre_dia, '').lower()
+
+        cursor.execute("SELECT hora_entrada, hora_salida FROM horarios WHERE rut = ? AND LOWER(dia) = ?", (rut, dia))
+        filas = cursor.fetchall()
+        conexion.close()
+
+        total_minutos = 0
+        for entrada_str, salida_str in filas:
+            if not entrada_str or not salida_str:
+                continue
+            t1 = parse_hora_flexible(entrada_str)
+            t2 = parse_hora_flexible(salida_str)
+            if not (t1 and t2):
+                continue
+            total_minutos += int((t2 - t1).total_seconds() // 60)
+
+        if como_minutos:
+            return total_minutos
+
+        h, m = divmod(total_minutos, 60)
+        return f"{int(h)}h {int(m)}min"
+
+    except Exception as e:
+        print("Error al calcular horas administrativas:", e)
+        return 0 if como_minutos else "00:00"
+
+
+# ===================== UI / REPORTES =====================
 
 def construir_reportes(frame_padre):
     registros_por_dia = {}
@@ -42,60 +129,7 @@ def construir_reportes(frame_padre):
 
         ctk.CTkButton(top, text="Seleccionar", command=poner_fecha).pack(pady=5)
 
-    def obtener_horas_administrativo(rut, fecha_str, como_minutos=False):
-        try:
-            conexion = sqlite3.connect("reloj_control.db")
-            cursor = conexion.cursor()
-
-            if isinstance(fecha_str, str):
-                fecha_dt = datetime.strptime(fecha_str, "%Y-%m-%d")
-            else:
-                fecha_dt = fecha_str
-
-            nombre_dia = fecha_dt.strftime("%A")
-            dias_map = {
-                'Monday': 'lunes', 'Tuesday': 'martes', 'Wednesday': 'miércoles',
-                'Thursday': 'jueves', 'Friday': 'viernes', 'Saturday': 'sábado', 'Sunday': 'domingo'
-            }
-            dia = dias_map.get(nombre_dia, '').lower()
-
-            cursor.execute("SELECT hora_entrada, hora_salida FROM horarios WHERE rut = ? AND LOWER(dia) = ?", (rut, dia))
-            filas = cursor.fetchall()
-            conexion.close()
-
-            total_minutos = 0
-
-            total_minutos = 0
-
-            for entrada_str, salida_str in filas:
-                entrada_str = entrada_str.strip()
-                salida_str = salida_str.strip()
-
-                if not entrada_str or not salida_str:
-                    continue  # Ignorar registros incompletos
-
-                try:
-                    entrada = datetime.strptime(entrada_str, "%H:%M") if len(entrada_str) <= 5 else datetime.strptime(entrada_str, "%H:%M:%S")
-                    salida = datetime.strptime(salida_str, "%H:%M") if len(salida_str) <= 5 else datetime.strptime(salida_str, "%H:%M:%S")
-                except ValueError as ve:
-                    print(f"⚠️ Error en formato hora: {entrada_str} o {salida_str}")
-                    continue
-
-                duracion = salida - entrada
-                total_minutos += int(duracion.total_seconds() // 60)
-
-
-            if como_minutos:
-                return total_minutos
-
-            h, m = divmod(total_minutos, 60)
-            return f"{int(h)}h {int(m)}min"
-
-        except Exception as e:
-            print("Error al calcular horas administrativas:", e)
-            return "00:00" if not como_minutos else 0
-
-
+    # ----------------- DÍAS ADMINISTRATIVOS -----------------
 
     def agregar_dias_administrativos(registros_por_dia, rut, desde_dt, hasta_dt):
         conexion = sqlite3.connect("reloj_control.db")
@@ -117,30 +151,50 @@ def construir_reportes(frame_padre):
                 fecha_dt = datetime.strptime(fecha, '%Y-%m-%d').date()
                 fecha_str = fecha
 
-                trabajado = obtener_horas_administrativo(rut, fecha_dt)
+                # Total del contrato para ese día (texto)
+                trabajado_contrato = obtener_horas_administrativo(rut, fecha_dt)
 
                 if fecha_str not in registros_por_dia:
                     registros_por_dia[fecha_str] = {
                         "ingreso": "--",
                         "salida": "--",
-                        "obs_ingreso": motivo,
+                        "obs_ingreso": motivo or "",
                         "obs_salida": "",
-                        "trabajado": trabajado,
+                        "trabajado": trabajado_contrato,
                         "es_admin": True
                     }
                 else:
-                    registros_por_dia[fecha_str]["obs_ingreso"] = motivo
-                    registros_por_dia[fecha_str]["trabajado"] = trabajado
+                    # Ya existían registros (ej. ingreso sin salida), márcalo como admin
+                    registros_por_dia[fecha_str]["obs_ingreso"] = motivo or registros_por_dia[fecha_str].get("obs_ingreso", "")
                     registros_por_dia[fecha_str]["es_admin"] = True
+
+                    ingreso = registros_por_dia[fecha_str].get("ingreso")
+                    salida = registros_por_dia[fecha_str].get("salida")
+
+                    # Si el motivo es Cometido y NO hay salida,
+                    # completa la salida con el horario del día y calcula trabajado ingreso→salida_horario
+                    if motivo and "cometid" in motivo.lower() and (not salida or salida == "--"):
+                        _, hora_salida_horario = obtener_horario_del_dia(rut, fecha_dt)
+                        if hora_salida_horario:
+                            registros_por_dia[fecha_str]["salida"] = hora_salida_horario
+                            t1 = parse_hora_flexible(ingreso) if ingreso and ingreso != "--" else None
+                            t2 = parse_hora_flexible(hora_salida_horario)
+                            if t1 and t2:
+                                mins = int((t2 - t1).total_seconds() // 60)
+                                h, m = divmod(mins, 60)
+                                registros_por_dia[fecha_str]["trabajado"] = f"{h}h {m}min"
+                            else:
+                                registros_por_dia[fecha_str]["trabajado"] = trabajado_contrato
+                    else:
+                        # Administrativo normal: usa total del contrato
+                        registros_por_dia[fecha_str]["trabajado"] = trabajado_contrato
 
             except Exception as e:
                 print(f"Error al procesar día administrativo {fecha}: {str(e)}")
                 continue
 
-                
-        conexion.close()
+    # ----------------- EXPORTAR EXCEL -----------------
 
-    
     def exportar_excel():
         nonlocal label_estado, label_leyenda_admin
 
@@ -174,12 +228,12 @@ def construir_reportes(frame_padre):
             obs_salida = registros_por_dia[fecha].get("obs_salida", "")
             es_admin = registros_por_dia[fecha].get("es_admin", False)
             obs_texto = obs_ingreso or obs_salida
-            motivo = obs_ingreso.strip().lower()
+            motivo_lower = (obs_ingreso or obs_salida or "").lower()
 
-            trabajado_dia = "--:--"
+            trabajado_dia = registros_por_dia[fecha].get("trabajado", "--:--")
             estado_dia = "⚠️ Incompleto"
 
-            # CALCULAR ATRASO AUNQUE NO HAYA SALIDA
+            # ATRASO (solo usa hora_entrada esperada)
             if ingreso not in (None, "--"):
                 try:
                     fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
@@ -209,7 +263,7 @@ def construir_reportes(frame_padre):
                         t_esperado_ingreso = datetime.combine(fecha_base, hora_esperada_parsed.time())
 
                         delta_ingreso = (t_ingreso - t_esperado_ingreso).total_seconds()
-                        ingreso_valido = delta_ingreso <= 300
+                        ingreso_valido = delta_ingreso <= 300  # 5 min de holgura
 
                         if not ingreso_valido:
                             segundos_excedentes = delta_ingreso - 300
@@ -220,21 +274,17 @@ def construir_reportes(frame_padre):
                 except Exception as e:
                     print(f"❌ Error al calcular atraso para {fecha}: {e}")
 
-            # CALCULAR HORAS TRABAJADAS SOLO SI HAY INGRESO Y SALIDA
+            # HORAS TRABAJADAS (si hay ingreso y salida válidos y no es admin especial)
             if ingreso not in (None, "--") and salida not in (None, "--"):
                 t1 = parse_hora_flexible(ingreso)
                 t2 = parse_hora_flexible(salida)
                 if t1 and t2:
-                    duracion = (t2 - t1)
-                    minutos = int(duracion.total_seconds() // 60)
+                    minutos = int((t2 - t1).total_seconds() // 60)
                     h, m = divmod(minutos, 60)
                     trabajado_dia = f"{int(h):02}:{int(m):02}"
-                    total_minutos += minutos
-                else:
-                    trabajado_dia = "--:--"
+                    # Suma se hará más abajo según sea admin o no
 
-
-            # DÍA OK o INCOMPLETO
+            # ESTADO DEL DÍA
             if ingreso not in (None, "--") and salida not in (None, "--"):
                 if minutos_atraso_dia_para_excel == 0:
                     estado_dia = "✅ Día Completado Satisfactoriamente"
@@ -245,31 +295,46 @@ def construir_reportes(frame_padre):
             elif ingreso or salida:
                 dias_incompletos += 1
 
-            # ADMINISTRATIVO O PERMISO
+            # SUMATORIAS (distinguiendo admin/normal)
             if es_admin:
-                trabajado_dia = registros_por_dia[fecha].get("trabajado", trabajado_dia)
-                minutos = obtener_horas_administrativo(rut, fecha, como_minutos=True)
-                total_minutos += minutos
-
-                if "administrativo" in motivo:
+                # Clasificaciones
+                if "administrativo" in motivo_lower:
                     dias_administrativos += 1
                 else:
                     permisos_extra += 1
 
+                # Si es Cometido con ingreso, ya calculamos trabajado ingreso→salida_horario:
+                if "cometid" in motivo_lower and ingreso not in (None, "--"):
+                    if trabajado_dia and ":" in trabajado_dia:
+                        try:
+                            hh, mm = [int(x) for x in trabajado_dia.split(":")]
+                            total_minutos += hh * 60 + mm
+                        except:
+                            pass
+                else:
+                    # Administrativo estándar: sumar lo contratado
+                    minutos = obtener_horas_administrativo(rut, fecha, como_minutos=True)
+                    total_minutos += minutos
+
                 if estado_dia == "⚠️ Incompleto" and (ingreso in (None, "--") or salida in (None, "--")):
                     estado_dia = "📌 Permiso Aceptado"
+            else:
+                # Día normal: sumar lo calculado si hay trabajado_dia HH:MM
+                if trabajado_dia and ":" in trabajado_dia:
+                    try:
+                        hh, mm = [int(x) for x in trabajado_dia.split(":")]
+                        total_minutos += hh * 60 + mm
+                    except:
+                        pass
 
-            tipo_dia = "Administrativo" if es_admin else ("Normal" if ingreso and salida else "Incompleto")
+            tipo_dia = "Administrativo" if es_admin else ("Normal" if (ingreso and salida and ingreso != "--" and salida != "--") else "Incompleto")
 
-            print(f"📦 {fecha} → atraso: {minutos_atraso_dia_para_excel}")
             datos.append([
-                fecha, ingreso, salida, trabajado_dia,
-                minutos_atraso_dia_para_excel,
-                obs_texto, estado_dia, tipo_dia
+                fecha, ingreso or "--", salida or "--", trabajado_dia,
+                minutos_atraso_dia_para_excel, obs_texto, estado_dia, tipo_dia
             ])
-            print(f"✅ Excel recibirá {minutos_atraso_dia_para_excel} minutos para {fecha}")
 
-        # TOTALES Y LEYENDA
+        # Totales y leyendas
         h_tot, m_tot = divmod(total_minutos, 60)
         total_trabajado = f"{int(h_tot):02}:{int(m_tot):02}"
         datos.append(["", "", "", "", "", ""])
@@ -308,10 +373,7 @@ def construir_reportes(frame_padre):
         except Exception as e:
             label_estado.configure(text=f"❌ Error al exportar: {str(e)}", text_color="red")
 
-
-
-
-
+    # ----------------- BUSCAR Y MOSTRAR -----------------
 
     def buscar_reportes():
         nonlocal registros_por_dia, modo_exportable, label_estado, label_datos, label_total, label_leyenda_admin
@@ -338,17 +400,14 @@ def construir_reportes(frame_padre):
         else:
             label_datos.configure(text="RUT no encontrado")
             label_estado.configure(text="⚠️ RUT no registrado", text_color="orange")
+            conexion.close()
             return
-
-        # En la función buscar_reportes():
-        from datetime import timedelta
 
         if not fecha_desde or not fecha_hasta:
             hoy = datetime.today()
             desde_dt = hoy.replace(day=1)
             hasta_dt = hoy + timedelta(days=45)
             modo_exportable = True
-
         else:
             try:
                 desde_dt = datetime.strptime(fecha_desde, "%d/%m/%Y")
@@ -356,6 +415,7 @@ def construir_reportes(frame_padre):
                 modo_exportable = True
             except ValueError:
                 label_estado.configure(text="⚠️ Formato de fecha incorrecto", text_color="red")
+                conexion.close()
                 return
 
         cursor.execute("""
@@ -364,37 +424,37 @@ def construir_reportes(frame_padre):
             WHERE rut = ? AND fecha BETWEEN ? AND ?
             ORDER BY fecha
         """, (rut, desde_dt.strftime('%Y-%m-%d'), hasta_dt.strftime('%Y-%m-%d')))
-
         registros = cursor.fetchall()
 
+        registros_por_dia.clear()
+
         for fecha, hora_ingreso, hora_salida, observacion in registros:
-            registros_por_dia[fecha] = {
-                "ingreso": hora_ingreso if hora_ingreso else "--",
-                "salida": hora_salida if hora_salida else "--",
-                "obs_ingreso": observacion if hora_ingreso else "",
-                "obs_salida": observacion if hora_salida else "",
-                "motivo": ""
-            }
-        else:
-                # Si por alguna razón hay más de un registro por día (no debería), solo actualiza si el campo está vacío
-                if not registros_por_dia[fecha]["ingreso"] and hora_ingreso:
+            if fecha not in registros_por_dia:
+                registros_por_dia[fecha] = {
+                    "ingreso": hora_ingreso or "--",
+                    "salida":  hora_salida or "--",
+                    "obs_ingreso": observacion if hora_ingreso else "",
+                    "obs_salida":  observacion if hora_salida  else "",
+                    "motivo": ""
+                }
+            else:
+                if (not registros_por_dia[fecha]["ingreso"] or registros_por_dia[fecha]["ingreso"] == "--") and hora_ingreso:
                     registros_por_dia[fecha]["ingreso"] = hora_ingreso
                     registros_por_dia[fecha]["obs_ingreso"] = observacion
-                if not registros_por_dia[fecha]["salida"] and hora_salida:
+                if (not registros_por_dia[fecha]["salida"] or registros_por_dia[fecha]["salida"] == "--") and hora_salida:
                     registros_por_dia[fecha]["salida"] = hora_salida
-                    registros_por_dia[fecha]["obs_salida"] = observacion    
+                    registros_por_dia[fecha]["obs_salida"] = observacion
 
-
+        # Añadir administrativos y aplicar regla de Cometido
         agregar_dias_administrativos(registros_por_dia, rut, desde_dt, hasta_dt)
         conexion.close()
 
-        # Revisar si hay días administrativos en el futuro
+        # Estado visual
         hoy = datetime.today().date()
         dias_admin_futuros = [
             f for f in registros_por_dia
             if registros_por_dia[f].get("es_admin", False) and datetime.strptime(f, "%Y-%m-%d").date() > hoy
         ]
-
         if dias_admin_futuros:
             label_estado.configure(
                 text=f"✅ Reporte generado\n📌 Incluye {len(dias_admin_futuros)} día(s) administrativo(s) futuro(s)",
@@ -403,7 +463,7 @@ def construir_reportes(frame_padre):
         else:
             label_estado.configure(text="✅ Reporte generado", text_color="green")
 
-
+        # Render tabla
         if registros_por_dia:
             encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Obs. Ingreso", "Obs. Salida"]
             for col, texto in enumerate(encabezados):
@@ -418,16 +478,13 @@ def construir_reportes(frame_padre):
                 obs_salida = registros_por_dia[fecha].get("obs_salida", "")
                 es_admin = registros_por_dia[fecha].get("es_admin", False)
 
-                # Valor por defecto:
                 trabajado = registros_por_dia[fecha].get("trabajado", "Incompleto")
 
-                # Si ambos existen y no es admin, calcula las horas:
                 if not es_admin and ingreso not in (None, "--") and salida not in (None, "--"):
                     t1 = parse_hora_flexible(ingreso)
                     t2 = parse_hora_flexible(salida)
                     if t1 and t2:
-                        duracion = (t2 - t1)
-                        minutos = duracion.total_seconds() // 60
+                        minutos = int((t2 - t1).total_seconds() // 60)
                         h, m = divmod(minutos, 60)
                         trabajado = f"{int(h)}h {int(m)}min"
                         registros_por_dia[fecha]["trabajado"] = trabajado
@@ -435,19 +492,13 @@ def construir_reportes(frame_padre):
                     else:
                         trabajado = "Incompleto"
                         registros_por_dia[fecha]["trabajado"] = trabajado
-
                 elif ingreso in (None, "--") or salida in (None, "--"):
                     trabajado = "Incompleto"
                     registros_por_dia[fecha]["trabajado"] = trabajado
 
                 fecha_legible = datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y")
                 fila_datos = [
-                    fecha_legible,
-                    ingreso or "--",
-                    salida or "--",
-                    trabajado,
-                    obs_ingreso or "",
-                    obs_salida or ""
+                    fecha_legible, ingreso or "--", salida or "--", trabajado, obs_ingreso or "", obs_salida or ""
                 ]
 
                 for col, val in enumerate(fila_datos):
@@ -467,43 +518,40 @@ def construir_reportes(frame_padre):
 
             h_tot, m_tot = divmod(total_minutos, 60)
             label_total.configure(text=f"Total trabajado: {int(h_tot)}h {int(m_tot)}min", text_color="white")
-            from datetime import timedelta
 
-            # Calcular inicio y fin de la semana actual
+            # Total semanal (opcional)
             hoy = datetime.today().date()
-            inicio_semana = hoy - timedelta(days=hoy.weekday())  # lunes
-            fin_semana = inicio_semana + timedelta(days=6)       # domingo
+            inicio_semana = hoy - timedelta(days=hoy.weekday())
+            fin_semana = inicio_semana + timedelta(days=6)
 
-            # Total por semana
             minutos_semana = 0
-            for fecha in registros_por_dia:
-                fecha_dt = datetime.strptime(fecha, "%Y-%m-%d").date()
+            for f in registros_por_dia:
+                fecha_dt = datetime.strptime(f, "%Y-%m-%d").date()
                 if inicio_semana <= fecha_dt <= fin_semana:
-                    trabajado = registros_por_dia[fecha].get("trabajado", "0h 0min")
-                    if "h" in trabajado:
-                        partes = trabajado.replace("min", "").split("h")
+                    trabaj = registros_por_dia[f].get("trabajado", "0h 0min")
+                    if "h" in trabaj:
                         try:
+                            partes = trabaj.replace("min", "").split("h")
                             horas = int(partes[0].strip())
                             mins = int(partes[1].strip())
                             minutos_semana += horas * 60 + mins
                         except:
                             pass
-
             h_sem, m_sem = divmod(minutos_semana, 60)
             ctk.CTkLabel(frame, text=f"Total trabajado esta semana: {h_sem}h {m_sem}min", font=("Arial", 12)).pack(pady=2)
 
-            label_estado.configure(text="✅ Reporte generado", text_color="green")
         else:
             label_total.configure(text="")
             ctk.CTkLabel(frame_tabla, text="No hay registros en este rango", text_color="orange").grid(row=0, column=0, columnspan=6, pady=10)
             label_estado.configure(text="⚠️ Sin registros", text_color="orange")
+
+    # ----------------- EXPORTAR MENSUAL MASIVO -----------------
 
     def exportar_mes_completo():
         try:
             conexion = sqlite3.connect("reloj_control.db")
             cursor = conexion.cursor()
 
-            # Obtener todos los trabajadores
             cursor.execute("SELECT rut, nombre, apellido FROM trabajadores")
             trabajadores = cursor.fetchall()
 
@@ -514,27 +562,24 @@ def construir_reportes(frame_padre):
             datos_globales = []
 
             for rut, nombre, apellido in trabajadores:
-                registros_por_dia = {}
+                registros_por_dia_local = {}
 
-                # Obtener registros normales
                 cursor.execute("""
-                SELECT fecha, hora, tipo, observacion FROM registros
-                WHERE rut = ? AND fecha BETWEEN ? AND ?
-                ORDER BY fecha, hora
-            """, (rut, desde_dt.strftime('%Y-%m-%d'), hasta_dt.strftime('%Y-%m-%d')))
-            registros = cursor.fetchall()
+                    SELECT fecha, hora, tipo, observacion FROM registros
+                    WHERE rut = ? AND fecha BETWEEN ? AND ?
+                    ORDER BY fecha, hora
+                """, (rut, desde_dt.strftime('%Y-%m-%d'), hasta_dt.strftime('%Y-%m-%d')))
+                registros = cursor.fetchall()
 
-            for fecha, hora, tipo, obs in registros:
-                if fecha not in registros_por_dia:
-                    registros_por_dia[fecha] = {"ingreso": None, "salida": None, "motivo": ""}
-                registros_por_dia[fecha][tipo] = hora
-                if tipo == "ingreso":
-                    registros_por_dia[fecha]["obs_ingreso"] = obs
-                elif tipo == "salida":
-                    registros_por_dia[fecha]["obs_salida"] = obs
+                for fecha, hora, tipo, obs in registros:
+                    if fecha not in registros_por_dia_local:
+                        registros_por_dia_local[fecha] = {"ingreso": None, "salida": None, "motivo": ""}
+                    registros_por_dia_local[fecha][tipo] = hora
+                    if tipo == "ingreso":
+                        registros_por_dia_local[fecha]["obs_ingreso"] = obs
+                    elif tipo == "salida":
+                        registros_por_dia_local[fecha]["obs_salida"] = obs
 
-
-                # Agregar días administrativos con motivo
                 cursor.execute("""
                     SELECT fecha, motivo FROM dias_libres
                     WHERE rut = ? AND fecha BETWEEN ? AND ?
@@ -542,34 +587,35 @@ def construir_reportes(frame_padre):
                 dias_admin = cursor.fetchall()
 
                 for fecha, motivo in dias_admin:
-                    if fecha not in registros_por_dia:
-                        registros_por_dia[fecha] = {
-                            "ingreso": "--", "salida": "--", "motivo": motivo, "obs_ingreso": motivo, "obs_salida": ""
+                    if fecha not in registros_por_dia_local:
+                        registros_por_dia_local[fecha] = {
+                            "ingreso": "--", "salida": "--", "motivo": motivo,
+                            "obs_ingreso": motivo, "obs_salida": ""
                         }
                     else:
-                        registros_por_dia[fecha]["motivo"] = motivo
-                        registros_por_dia[fecha]["obs_ingreso"] = motivo
+                        registros_por_dia_local[fecha]["motivo"] = motivo
+                        registros_por_dia_local[fecha]["obs_ingreso"] = motivo
 
-                for fecha in sorted(registros_por_dia):
-                    ingreso = registros_por_dia[fecha].get("ingreso", "--")
-                    salida = registros_por_dia[fecha].get("salida", "--")
-                    motivo = registros_por_dia[fecha].get("motivo", "")
-                    obs_ingreso = registros_por_dia[fecha].get("obs_ingreso", "")
-                    obs_salida = registros_por_dia[fecha].get("obs_salida", "")
+                for fecha in sorted(registros_por_dia_local):
+                    ingreso = registros_por_dia_local[fecha].get("ingreso", "--")
+                    salida = registros_por_dia_local[fecha].get("salida", "--")
+                    motivo = registros_por_dia_local[fecha].get("motivo", "")
+                    obs_ingreso = registros_por_dia_local[fecha].get("obs_ingreso", "")
+                    obs_salida = registros_por_dia_local[fecha].get("obs_salida", "")
 
-                    # Calcular horas trabajadas
                     if ingreso not in (None, "--") and salida not in (None, "--"):
                         try:
-                            t1 = datetime.strptime(ingreso, "%H:%M:%S") if len(ingreso) > 5 else datetime.strptime(ingreso, "%H:%M")
-                            t2 = datetime.strptime(salida, "%H:%M:%S") if len(salida) > 5 else datetime.strptime(salida, "%H:%M")
-                            duracion = t2 - t1
-                            minutos = int(duracion.total_seconds() // 60)
-                            h, m = divmod(minutos, 60)
-                            trabajado = f"{h}h {m}min"
+                            t1 = parse_hora_flexible(ingreso)
+                            t2 = parse_hora_flexible(salida)
+                            if t1 and t2:
+                                minutos = int((t2 - t1).total_seconds() // 60)
+                                h, m = divmod(minutos, 60)
+                                trabajado = f"{h}h {m}min"
+                            else:
+                                trabajado = "Error"
                         except:
                             trabajado = "Error"
                     elif motivo:
-                        # Si es administrativo, calcular según horario del contrato
                         trabajado = obtener_horas_administrativo(rut, fecha)
                     else:
                         trabajado = "Incompleto"
@@ -582,7 +628,6 @@ def construir_reportes(frame_padre):
 
             conexion.close()
 
-            # Crear DataFrame
             columnas = [
                 "RUT", "Nombre", "Apellido", "Fecha",
                 "Ingreso", "Salida", "Horas Trabajadas",
@@ -590,7 +635,6 @@ def construir_reportes(frame_padre):
             ]
             df = pd.DataFrame(datos_globales, columns=columnas)
 
-            # Guardar archivo
             carpeta_descargas = os.path.join(os.path.expanduser("~"), "Downloads")
             nombre_archivo = f"reporte_mensual_completo_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
             ruta_completa = os.path.join(carpeta_descargas, nombre_archivo)
@@ -602,70 +646,28 @@ def construir_reportes(frame_padre):
         except Exception as e:
             messagebox.showerror("Error al exportar", str(e))
 
+    # ----------------- INTERFAZ -----------------
 
-
-    # === INTERFAZ ===
     frame = ctk.CTkFrame(frame_padre)
     frame.pack(fill="both", expand=True)
 
     ctk.CTkLabel(frame, text="Reportes por Funcionario", font=("Arial", 16)).pack(pady=10)
-        # --- Campo de búsqueda por nombre ---
-    lista_funcionarios = []
-    dict_nombre_rut = {}
 
-    try:
-        conexion = sqlite3.connect("reloj_control.db")
-        cursor = conexion.cursor()
-        cursor.execute("SELECT rut, nombre, apellido FROM trabajadores")
-        for rut, nombre, apellido in cursor.fetchall():
-            nombre_completo = f"{nombre} {apellido}"
-            lista_funcionarios.append(nombre_completo)
-            dict_nombre_rut[nombre_completo] = rut
-        conexion.close()
-    except Exception as e:
-        print(f"Error al cargar funcionarios: {e}")
-
-    # === FUNCIONARIO BUSCADOR COMBO ===
-
-    combo_var = tk.StringVar()
+    # --- Buscador por nombre -> RUT ---
     lista_nombres = []
     dict_nombre_rut = {}
-
-    # Cargar nombres desde la base de datos
     try:
         conexion = sqlite3.connect("reloj_control.db")
         cursor = conexion.cursor()
         cursor.execute("SELECT rut, nombre, apellido FROM trabajadores")
-        for rut, nombre, apellido in cursor.fetchall():
+        for _rut, nombre, apellido in cursor.fetchall():
             nombre_completo = f"{nombre} {apellido}"
             lista_nombres.append(nombre_completo)
-            dict_nombre_rut[nombre_completo] = rut
+            dict_nombre_rut[nombre_completo] = _rut
         conexion.close()
     except Exception as e:
         print(f"Error al cargar funcionarios: {e}")
 
-    # Función para actualizar sugerencias
-    def actualizar_opciones(valor_actual):
-        filtro = valor_actual.lower()
-        coincidencias = [n for n in lista_nombres if filtro in n.lower()]
-        if not coincidencias:
-            coincidencias = ["No hay coincidencias"]
-        combo_funcionarios.configure(values=coincidencias)
-        combo_funcionarios.set(valor_actual)
-
-        # Autolimpia el campo RUT si el texto no coincide exactamente
-        if valor_actual not in dict_nombre_rut:
-            entry_rut.delete(0, "end")
-
-    # Al seleccionar opción
-    def seleccionar_funcionario(valor):
-        if valor == "No hay coincidencias":
-            return
-        rut = dict_nombre_rut.get(valor, "")
-        entry_rut.delete(0, "end")
-        entry_rut.insert(0, rut)
-
-    # Crear un subframe horizontal para el ComboBox y el botón Limpiar
     combo_frame = ctk.CTkFrame(frame, fg_color="transparent")
     combo_frame.pack(pady=5)
 
@@ -673,7 +675,6 @@ def construir_reportes(frame_padre):
         if combo_funcionarios.get() == "Buscar Usuario por nombre":
             combo_funcionarios.set("")
 
-    # Luego crear el ComboBox
     combo_funcionarios = ctk.CTkComboBox(
         combo_frame,
         values=["Buscar Usuario por nombre"],
@@ -684,51 +685,36 @@ def construir_reportes(frame_padre):
     )
     combo_funcionarios.set("Buscar Usuario por nombre")
     combo_funcionarios.pack(side="left", padx=(0, 10))
-
-    # Finalmente conectar el evento
     combo_funcionarios.bind("<FocusIn>", al_hacer_click)
-    
 
-    # Función del botón Limpiar
+    def actualizar_opciones(valor_actual):
+        filtro = valor_actual.lower()
+        coincidencias = [n for n in lista_nombres if filtro in n.lower()]
+        if not coincidencias:
+            coincidencias = ["No hay coincidencias"]
+        combo_funcionarios.configure(values=coincidencias)
+        combo_funcionarios.set(valor_actual)
+        if valor_actual not in dict_nombre_rut:
+            entry_rut.delete(0, "end")
+
+    def seleccionar_funcionario(valor):
+        if valor == "No hay coincidencias":
+            return
+        _rut = dict_nombre_rut.get(valor, "")
+        entry_rut.delete(0, "end")
+        entry_rut.insert(0, _rut)
+
+    combo_funcionarios.bind("<KeyRelease>", lambda event: actualizar_opciones(combo_funcionarios.get()))
+    combo_funcionarios.bind("<Return>", lambda event: seleccionar_funcionario(combo_funcionarios.get()))
+
     def limpiar_combobox():
         combo_funcionarios.set("Buscar Usuario por nombre")
         combo_funcionarios.configure(values=lista_nombres)
         entry_rut.delete(0, 'end')
 
-    # Botón Limpiar
-    boton_limpiar = ctk.CTkButton(
-        combo_frame,
-        text="Limpiar",
-        width=80,
-        height=35,
-        command=limpiar_combobox
-    )
-    boton_limpiar.pack(side="left")
+    ctk.CTkButton(combo_frame, text="Limpiar", width=80, height=35, command=limpiar_combobox).pack(side="left")
 
-    def buscar_por_enter(event):
-        texto = combo_funcionarios.get().lower()
-        if texto and texto != "buscar usuario por nombre":
-            resultados = [nombre for nombre in lista_nombres if texto in nombre.lower()]
-            if resultados:
-                combo_funcionarios.configure(values=resultados)
-                combo_funcionarios.set(resultados[0])  # Opcional: seleccionar primero
-                seleccionar_funcionario(resultados[0])  # Simular acción
-            else:
-                combo_funcionarios.configure(values=["Sin resultados"])
-                combo_funcionarios.set("Sin resultados")
-
-    combo_funcionarios.bind("<Return>", buscar_por_enter)
-
-
-    # 🔍 Detectar escritura en tiempo real
-    combo_funcionarios.bind("<KeyRelease>", lambda event: actualizar_opciones(combo_funcionarios.get()))
-
-    # ⌨️ Acción extra al presionar Enter
-    combo_funcionarios.bind("<Return>", lambda event: actualizar_opciones(combo_funcionarios.get()))
-
-
-
-
+    # --- RUT + Fechas ---
     entry_rut = ctk.CTkEntry(frame, placeholder_text="RUT (Ej: 12345678-9)")
     entry_rut.pack(pady=5)
     entry_rut.bind("<Return>", lambda event: buscar_reportes())
