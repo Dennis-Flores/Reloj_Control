@@ -9,6 +9,7 @@ import os
 import pickle
 import threading
 from tkinter import ttk
+from PIL import Image, ImageTk  # ← para mostrar la foto
 
 def cargar_nombres_ruts():
     conexion = sqlite3.connect("reloj_control.db")
@@ -88,7 +89,10 @@ def construir_edicion(frame_padre, on_actualizacion=None):
 
             entry_nombre.delete(0, 'end'); entry_nombre.insert(0, trabajador[0])
             entry_apellido.delete(0, 'end'); entry_apellido.insert(0, trabajador[1])
-            entry_rut.configure(state="normal"); entry_rut.delete(0, 'end'); entry_rut.insert(0, trabajador[2]); entry_rut.configure(state="disabled")
+            entry_rut.configure(state="normal")
+            entry_rut.delete(0, 'end')
+            entry_rut.insert(0, trabajador[2])
+            entry_rut.configure(state="disabled")
             entry_profesion.delete(0, 'end'); entry_profesion.insert(0, trabajador[3])
             entry_correo.delete(0, 'end'); entry_correo.insert(0, trabajador[4])
             if trabajador[5]:
@@ -99,11 +103,18 @@ def construir_edicion(frame_padre, on_actualizacion=None):
 
             cursor.execute("SELECT dia, turno, hora_entrada, hora_salida FROM horarios WHERE rut = ?", (rut,))
             horarios = cursor.fetchall()
+            # limpiar primero
+            for _, _, ent, sal in campos_horarios:
+                ent.delete(0, 'end')
+                sal.delete(0, 'end')
+            # rellenar
             for dia, turno, entrada, salida in horarios:
                 for i, (d, t, e, s) in enumerate(campos_horarios):
                     if d == dia and t == turno:
-                        e.delete(0, 'end'); e.insert(0, entrada)
-                        s.delete(0, 'end'); s.insert(0, salida)
+                        if entrada:
+                            e.insert(0, entrada)
+                        if salida:
+                            s.insert(0, salida)
                         break
 
             ruta_facial = os.path.join("rostros", f"{rut}.pkl")
@@ -143,7 +154,6 @@ def construir_edicion(frame_padre, on_actualizacion=None):
         label_estado.configure(text="")
         label_verificacion.configure(text="Verificación facial: ---", text_color="white")   
 
-
     btn_buscar_nombre = ctk.CTkButton(fila_nombres, text="Buscar por Nombre", command=cargar_por_nombre)
     btn_buscar_nombre.pack(side="left", padx=5)
 
@@ -163,15 +173,7 @@ def construir_edicion(frame_padre, on_actualizacion=None):
     btn_buscar = ctk.CTkButton(fila_rut, text="Buscar por RUT", command=cargar_usuario)
     btn_buscar.pack(side="left", padx=5)
 
-
-    
-
-
- 
-
     entry_rut_buscar.bind("<Return>", lambda event: cargar_usuario())   
-
-    
 
     panel_datos = ctk.CTkFrame(contenedor, corner_radius=10)
     panel_datos.grid(row=1, column=0, padx=30, sticky="n")
@@ -214,8 +216,6 @@ def construir_edicion(frame_padre, on_actualizacion=None):
             text_color="white"
         )
 
-        rostro_capturado = False
-
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -235,14 +235,25 @@ def construir_edicion(frame_padre, on_actualizacion=None):
                 encodings = face_recognition.face_encodings(rgb)
 
                 if encodings:
-                    ruta_guardado = os.path.join("rostros", f"{rut_actual}.pkl")
                     if not os.path.exists("rostros"):
                         os.makedirs("rostros")
-                    with open(ruta_guardado, "wb") as f:
+                    # normalizamos archivo por si el RUT viene con puntos/espacios
+                    rut_norm = rut_actual.replace(".", "").replace(" ", "")
+                    ruta_pkl = os.path.join("rostros", f"{rut_norm}.pkl")
+                    ruta_jpg = os.path.join("rostros", f"{rut_norm}.jpg")
+
+                    # guarda JPG de referencia y encoding
+                    try:
+                        cv2.imwrite(ruta_jpg, frame)
+                    except Exception:
+                        pass
+
+                    with open(ruta_pkl, "wb") as f:
                         pickle.dump(encodings[0], f)
 
                     conexion = sqlite3.connect("reloj_control.db")
                     cursor = conexion.cursor()
+                    # guardamos el nombre del archivo con el RUT “tal cual” como usabas antes
                     cursor.execute(
                         "UPDATE trabajadores SET verificacion_facial = ? WHERE rut = ?",
                         (f"{rut_actual}.pkl", rut_actual)
@@ -253,7 +264,6 @@ def construir_edicion(frame_padre, on_actualizacion=None):
                     with open("log_capturas.txt", "a", encoding="utf-8") as log:
                         log.write(f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} - Captura de rostro para RUT {rut_actual}\n")
 
-                    rostro_capturado = True
                     label_verificacion.configure(text="✅ Rostro actualizado correctamente", text_color="green")
                     break
                 else:
@@ -262,9 +272,79 @@ def construir_edicion(frame_padre, on_actualizacion=None):
         cap.release()
         cv2.destroyAllWindows()
 
+    # Botón para volver a registrar rostro
     ctk.CTkButton(panel_datos, text="📸 Volver a registrar rostro", font=("Arial", 14, "bold"), command=registrar_rostro).pack(pady=10)
 
+    def _buscar_foto_por_rut_archivo(rut: str):
+        """Busca una foto en /rostros por RUT con extensiones comunes."""
+        if not rut:
+            return None
+        rut_norm = rut.replace(".", "").replace(" ", "").strip()
+        candidatos = [
+            f"{rut_norm}.jpg", f"{rut_norm}.jpeg", f"{rut_norm}.png",
+            f"{rut_norm.replace('-', '')}.jpg", f"{rut_norm.replace('-', '')}.jpeg", f"{rut_norm.replace('-', '')}.png",
+        ]
+        for nombre in candidatos:
+            p = os.path.join("rostros", nombre)
+            if os.path.isfile(p):
+                return p
+        return None
 
+    def ver_foto_registrada():
+        rut = entry_rut.get().strip()
+        nombre_completo = f"{entry_nombre.get().strip()} {entry_apellido.get().strip()}".strip()
+        if not rut:
+            tk.messagebox.showinfo("Selecciona usuario", "Primero carga un usuario (RUT) para ver su foto.")
+            return
+
+        path = _buscar_foto_por_rut_archivo(rut)
+        if not path:
+            tk.messagebox.showwarning(
+                "Sin foto",
+                "No se encontró una fotografía registrada para este RUT.\n\n"
+                "Sugerencia: usa “📸 Volver a registrar rostro” para crearla."
+            )
+            return
+
+        # Ventana modal para mostrar la imagen
+        Top = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
+        win = Top(frame_padre)
+        win.title("Foto registrada")
+        try:
+            win.resizable(False, False)
+            win.transient(frame_padre.winfo_toplevel())
+            win.grab_set()
+        except Exception:
+            pass
+
+        cont = ctk.CTkFrame(win, corner_radius=10)
+        cont.pack(fill="both", expand=True, padx=16, pady=16)
+
+        titulo = f"{nombre_completo}  |  {rut}" if nombre_completo else rut
+        ctk.CTkLabel(cont, text=titulo, font=("Arial", 15, "bold")).pack(pady=(0, 8))
+
+        img = Image.open(path)
+        img.thumbnail((520, 520), Image.LANCZOS)
+        img_tk = ImageTk.PhotoImage(img)
+
+        lbl_img = ctk.CTkLabel(cont, text="")
+        lbl_img.pack(pady=6)
+        lbl_img.configure(image=img_tk)
+        lbl_img.image = img_tk  # evitar GC
+
+        ctk.CTkButton(cont, text="Cerrar", command=win.destroy).pack(pady=(10, 0))
+
+        # Centrar la ventana respecto al frame
+        frame_padre.update_idletasks()
+        w, h = img_tk.width() + 64, img_tk.height() + 140
+        x = frame_padre.winfo_rootx() + (frame_padre.winfo_width() // 2) - (w // 2)
+        y = frame_padre.winfo_rooty() + (frame_padre.winfo_height() // 2) - (h // 2)
+        win.geometry(f"{max(w, 360)}x{max(h, 260)}+{max(x, 0)}+{max(y, 0)}")
+
+    # Botón para ver la foto
+    ctk.CTkButton(panel_datos, text="👁️ Ver foto registrada", command=ver_foto_registrada).pack(pady=(0, 10))
+
+    # Panel de horarios
     panel_horarios = ctk.CTkFrame(contenedor, fg_color="transparent")
     panel_horarios.grid(row=1, column=1, padx=30, sticky="n")
 
@@ -289,8 +369,6 @@ def construir_edicion(frame_padre, on_actualizacion=None):
     label_estado = ctk.CTkLabel(frame_padre, text="")
     label_estado.pack(pady=5)
 
-    
-
     def guardar_cambios():
         rut = entry_rut.get().strip()
         if not rut:
@@ -309,10 +387,17 @@ def construir_edicion(frame_padre, on_actualizacion=None):
             rut
         ))
 
+        # Horarios opcionales: solo insertar filas con entrada y salida no vacías
         cursor.execute("DELETE FROM horarios WHERE rut = ?", (rut,))
         for dia, turno, entrada, salida in campos_horarios:
-            cursor.execute("INSERT INTO horarios (rut, dia, turno, hora_entrada, hora_salida) VALUES (?, ?, ?, ?, ?)",
-                           (rut, dia, turno, entrada.get().strip(), salida.get().strip()))
+            h_in = entrada.get().strip()
+            h_out = salida.get().strip()
+            if h_in and h_out:
+                cursor.execute(
+                    "INSERT INTO horarios (rut, dia, turno, hora_entrada, hora_salida) VALUES (?, ?, ?, ?, ?)",
+                    (rut, dia, turno, h_in, h_out)
+                )
+
         conexion.commit()
         conexion.close()
         label_estado.configure(text="✅ Cambios guardados", text_color="green")

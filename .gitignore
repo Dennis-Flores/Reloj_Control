@@ -1,3 +1,33 @@
 face_recognition_models/
 face_recognition_models - respaldo/
 **/face_recognition_models*/
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+.env
+
+# IDEs/OS
+.vscode/
+.idea/
+.DS_Store
+
+# PyInstaller
+build/
+dist/
+*.spec
+
+# Logs/temporal
+*.log
+*.tmp
+# PyInstaller
+build/
+dist/
+*.spec
+
+# PyInstaller
+build/
+dist/
+*.spec

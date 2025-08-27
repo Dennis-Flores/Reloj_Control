@@ -9,10 +9,28 @@ import cv2
 import os
 import pickle
 from tkinter import messagebox
+from PIL import Image, ImageTk  # ← para mostrar la foto
 
 crear_bd()
 
 def construir_registro(frame_padre, on_guardado=None):
+    # ---------- helpers ----------
+    def _buscar_foto_por_rut_archivo(rut: str):
+        """Busca una foto en /rostros por RUT con extensiones comunes (normaliza puntos/espacios/guión)."""
+        if not rut:
+            return None
+        rut_norm = rut.replace(".", "").replace(" ", "").strip()
+        candidatos = [
+            f"{rut_norm}.jpg", f"{rut_norm}.jpeg", f"{rut_norm}.png",
+            f"{rut_norm.replace('-', '')}.jpg", f"{rut_norm.replace('-', '')}.jpeg", f"{rut_norm.replace('-', '')}.png",
+        ]
+        for nombre in candidatos:
+            p = os.path.join("rostros", nombre)
+            if os.path.isfile(p):
+                return p
+        return None
+
+    # ---------- acciones ----------
     def registrar_rostro():
         rut = entry_rut.get().strip()
         if not rut:
@@ -24,50 +42,105 @@ def construir_registro(frame_padre, on_guardado=None):
             messagebox.showerror("Error", "No se pudo acceder a la cámara.")
             return
 
-        messagebox.showinfo("Info", "Presiona 's' para capturar rostro, 'q' para cancelar.")
+        messagebox.showinfo(
+            "Captura de Rostro",
+            "🎥 Enfoca tu rostro. Presiona ESPACIO para capturar o ESC para cancelar."
+        )
 
-        rostro_capturado = False
         while True:
             ret, frame = cap.read()
             if not ret:
-                break
+                continue
 
-            cv2.imshow("Captura de Rostro - Presiona 's' para guardar", frame)
+            cv2.putText(frame, "ESPACIO=Capturar | ESC=Salir", (30, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+            cv2.imshow("Captura de rostro", cv2.resize(frame, (800, 600)))
             key = cv2.waitKey(1)
 
-            if key == ord("s"):
-                rostro_capturado = True
-                ruta_guardado = os.path.join("rostros", f"{rut}.pkl")
-
-                if not os.path.exists("rostros"):
-                    os.makedirs("rostros")
-
+            if key == 27:  # ESC
+                break
+            elif key == 32:  # SPACE
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 encodings = face_recognition.face_encodings(rgb)
 
                 if encodings:
-                    with open(ruta_guardado, "wb") as f:
+                    if not os.path.exists("rostros"):
+                        os.makedirs("rostros")
+
+                    # normaliza para archivos
+                    rut_norm = rut.replace(".", "").replace(" ", "")
+                    ruta_pkl = os.path.join("rostros", f"{rut_norm}.pkl")
+                    ruta_jpg = os.path.join("rostros", f"{rut_norm}.jpg")
+
+                    # guarda encoding y foto
+                    with open(ruta_pkl, "wb") as f:
                         pickle.dump(encodings[0], f)
+                    try:
+                        cv2.imwrite(ruta_jpg, frame)
+                    except Exception:
+                        pass
 
-                    conexion = sqlite3.connect("reloj_control.db")
-                    cursor = conexion.cursor()
-                    cursor.execute("UPDATE trabajadores SET verificacion_facial = ? WHERE rut = ?", (f"{rut}.pkl", rut))
-                    conexion.commit()
-                    conexion.close()
+                    # guarda referencia en la BD (mantén el rut “tal cual” para compatibilidad)
+                    con = sqlite3.connect("reloj_control.db")
+                    cur = con.cursor()
+                    cur.execute("UPDATE trabajadores SET verificacion_facial = ? WHERE rut = ?", (f"{rut}.pkl", rut))
+                    con.commit()
+                    con.close()
 
-                    messagebox.showinfo("Éxito", "Rostro registrado correctamente.")
+                    messagebox.showinfo("Éxito", "✅ Rostro registrado correctamente.")
                 else:
-                    messagebox.showwarning("Advertencia", "No se detectó rostro. Intenta nuevamente.")
-
-                break
-
-            elif key == ord("q"):
+                    messagebox.showwarning("Advertencia", "❌ No se detectó rostro. Intenta nuevamente.")
                 break
 
         cap.release()
         cv2.destroyAllWindows()
-        if not rostro_capturado:
-            messagebox.showinfo("Cancelado", "Registro de rostro cancelado.")
+
+    def ver_foto_registrada():
+        rut = entry_rut.get().strip()
+        nombre_completo = f"{entry_nombre.get().strip()} {entry_apellido.get().strip()}".strip()
+        if not rut:
+            messagebox.showinfo("Selecciona usuario", "Ingresa el RUT primero para buscar su foto.")
+            return
+
+        path = _buscar_foto_por_rut_archivo(rut)
+        if not path:
+            messagebox.showwarning("Sin foto", "No se encontró una fotografía registrada para este RUT.")
+            return
+
+        # Ventana modal con la foto
+        Top = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
+        win = Top(frame_padre)
+        win.title("Foto registrada")
+        try:
+            win.resizable(False, False)
+            win.transient(frame_padre.winfo_toplevel())
+            win.grab_set()
+        except Exception:
+            pass
+
+        cont = ctk.CTkFrame(win, corner_radius=10)
+        cont.pack(fill="both", expand=True, padx=16, pady=16)
+
+        titulo = f"{nombre_completo}  |  {rut}" if nombre_completo else rut
+        ctk.CTkLabel(cont, text=titulo, font=("Arial", 15, "bold")).pack(pady=(0, 8))
+
+        img = Image.open(path)
+        img.thumbnail((520, 520), Image.LANCZOS)
+        img_tk = ImageTk.PhotoImage(img)
+
+        lbl_img = ctk.CTkLabel(cont, text="")
+        lbl_img.pack(pady=6)
+        lbl_img.configure(image=img_tk)
+        lbl_img.image = img_tk  # evita GC
+
+        ctk.CTkButton(cont, text="Cerrar", command=win.destroy).pack(pady=(10, 0))
+
+        # centrar
+        frame_padre.update_idletasks()
+        w, h = img_tk.width() + 64, img_tk.height() + 140
+        x = frame_padre.winfo_rootx() + (frame_padre.winfo_width() // 2) - (w // 2)
+        y = frame_padre.winfo_rooty() + (frame_padre.winfo_height() // 2) - (h // 2)
+        win.geometry(f"{max(w, 360)}x{max(h, 260)}+{max(x, 0)}+{max(y, 0)}")
 
     def guardar_trabajador():
         nombre = entry_nombre.get().strip()
@@ -81,43 +154,35 @@ def construir_registro(frame_padre, on_guardado=None):
             label_estado.configure(text="❌ Faltan campos obligatorios", text_color="red")
             return
 
-        conexion = sqlite3.connect("reloj_control.db")
-        cursor = conexion.cursor()
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
         try:
-            cursor.execute('''
+            cur.execute('''
                 INSERT INTO trabajadores 
                 (nombre, apellido, rut, profesion, correo, cumpleanos)
                 VALUES (?, ?, ?, ?, ?, ?)
             ''', (nombre, apellido, rut, profesion, correo, cumpleanos))
 
-
+            # Horarios opcionales: inserta solo si entrada y salida tienen valor
             for dia, turno, entrada_entry, salida_entry in campos_horarios:
-                hora_entrada = entrada_entry.get().strip()
-                hora_salida = salida_entry.get().strip()
+                h_in = entrada_entry.get().strip()
+                h_out = salida_entry.get().strip()
+                if h_in and h_out:
+                    cur.execute('''
+                        INSERT INTO horarios (rut, dia, turno, hora_entrada, hora_salida)
+                        VALUES (?, ?, ?, ?, ?)
+                    ''', (rut, dia, turno, h_in, h_out))
 
-                if not hora_entrada or not hora_salida:
-                    label_estado.configure(text=f"⚠️ Horario incompleto en {dia} - {turno}", text_color="orange")
-                    conexion.close()
-                    return
-                
-                cursor.execute('''
-                    INSERT INTO horarios (rut, dia, turno, hora_entrada, hora_salida)
-                    VALUES (?, ?, ?, ?, ?)
-                ''', (rut, dia, turno, hora_entrada, hora_salida))
-                
-
-
-            conexion.commit()
+            con.commit()
             label_estado.configure(text="✅ Nuevo Usuario registrado correctamente", text_color="green")
 
+            # limpiar
             for entry in entradas:
                 entry.delete(0, 'end')
             entry_cumple.set_date(datetime.today())
-
             for _, _, ent, sal in campos_horarios:
                 ent.delete(0, 'end')
                 sal.delete(0, 'end')
-
             entry_nombre.focus()
 
             if on_guardado:
@@ -125,9 +190,20 @@ def construir_registro(frame_padre, on_guardado=None):
 
         except sqlite3.IntegrityError:
             label_estado.configure(text="⚠️ RUT ya registrado", text_color="orange")
-        conexion.close()
+        finally:
+            con.close()
 
-    # Limpiar contenido
+    def limpiar_campos():
+        for entry in entradas:
+            entry.delete(0, 'end')
+        entry_cumple.set_date(datetime.today())
+        for _, _, ent, sal in campos_horarios:
+            ent.delete(0, 'end')
+            sal.delete(0, 'end')
+        label_estado.configure(text="")
+        entry_nombre.focus()
+
+    # ---------- UI ----------
     for widget in frame_padre.winfo_children():
         widget.destroy()
 
@@ -150,12 +226,16 @@ def construir_registro(frame_padre, on_guardado=None):
         e.pack(pady=4)
 
     ctk.CTkLabel(panel_datos, text="Cumpleaños").pack(pady=(10, 2))
-    entry_cumple = DateEntry(panel_datos, date_pattern="dd/mm/yyyy", width=18, background='darkblue', foreground='white', locale='es_CL')
+    entry_cumple = DateEntry(panel_datos, date_pattern="dd/mm/yyyy", width=18,
+                             background='darkblue', foreground='white', locale='es_CL')
     entry_cumple.set_date(datetime.today())
     entry_cumple.pack(pady=4)
 
-    # 📸 Botón de registrar rostro
-    ctk.CTkButton(panel_datos, text="📸 Tomar Fotografía", font=("Arial", 16), command=registrar_rostro, height=40).pack(pady=8)
+    # Botones biometría
+    ctk.CTkButton(panel_datos, text="📸 Tomar Fotografía", font=("Arial", 16),
+                  command=registrar_rostro, height=40).pack(pady=(8, 4))
+    ctk.CTkButton(panel_datos, text="👁️ Ver foto registrada",
+                  command=ver_foto_registrada).pack(pady=(0, 10))
 
     entradas = [entry_nombre, entry_apellido, entry_rut, entry_profesion, entry_correo]
 
@@ -181,46 +261,23 @@ def construir_registro(frame_padre, on_guardado=None):
             salida.pack(side="left", padx=2)
             campos_horarios.append((dia, clave_turno, entrada, salida))
 
-    def limpiar_campos():
-        for entry in entradas:
-            entry.delete(0, 'end')
-        entry_cumple.set_date(datetime.today())
-        for _, _, ent, sal in campos_horarios:
-            ent.delete(0, 'end')
-            sal.delete(0, 'end')
-        label_estado.configure(text="")
-        entry_nombre.focus()
-
-
-        # ---- Frame para centrar los botones ----
+    # Botones inferiores
     botones_frame = ctk.CTkFrame(frame_padre, fg_color="transparent")
     botones_frame.pack(pady=15, anchor="center")
 
-    # Botón Limpiar
     ctk.CTkButton(
-        botones_frame,
-        text="🧹 Limpiar Formulario",
-        fg_color="gray",
-        font=("Arial", 16),
-        command=limpiar_campos
+        botones_frame, text="🧹 Limpiar Formulario", fg_color="gray",
+        font=("Arial", 16), command=limpiar_campos
     ).pack(side="left", padx=10)
 
-    # Botón Guardar
     ctk.CTkButton(
-        botones_frame,
-        text="💾 Guardar Nuevo Usuario",
-        fg_color="green", font=("Arial", 16),
-        command=guardar_trabajador
+        botones_frame, text="💾 Guardar Nuevo Usuario", fg_color="green",
+        font=("Arial", 16), command=guardar_trabajador
     ).pack(side="left", padx=10)
 
-    # Label estado debajo
+    # Estado (único)
     label_estado = ctk.CTkLabel(frame_padre, text="")
     label_estado.pack(pady=5)
 
-
-    label_estado = ctk.CTkLabel(frame_padre, text="")
-    label_estado.pack(pady=5)
-    
-
-
+    # Focus inicial
     entry_nombre.focus()

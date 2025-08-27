@@ -5,7 +5,7 @@ import tkinter as tk
 from tkinter import messagebox
 from tkcalendar import Calendar
 import csv
-from tkinter import filedialog
+from tkinter import filedialog  # (ya no se usa para exportar automático, pero lo dejo por si luego lo quieres)
 try:
     from openpyxl import Workbook
     from openpyxl.styles import Font, Alignment, PatternFill
@@ -31,6 +31,13 @@ def construir_dia_administrativo(frame_padre):
         tk.Button(top, text="Seleccionar", command=poner_fecha).pack(pady=5)
 
     def exportar_informe():
+        """
+        Guarda automáticamente en la carpeta Descargas y abre el archivo.
+        - Si hay openpyxl: .xlsx bonito
+        - Si no hay openpyxl: fallback a .csv (se informa) y se abre
+        - Si hay selección en la tabla: pregunta si exportar solo seleccionados
+        - Aplica rango si ambas fechas dd/mm/aaaa son válidas
+        """
         rut = entry_rut.get().strip()
         if not rut:
             messagebox.showwarning("Falta RUT", "Primero selecciona/busca un trabajador (RUT).")
@@ -95,50 +102,56 @@ def construir_dia_administrativo(frame_padre):
             messagebox.showinfo("Sin datos", "No hay registros para exportar con los filtros actuales.")
             return
 
-        # Nombre sugerido único (timestamp)
+        # Carpeta Descargas (fallback a carpeta actual si no existe)
+        carpeta_descargas = os.path.join(os.path.expanduser("~"), "Downloads")
+        if not os.path.isdir(carpeta_descargas):
+            carpeta_descargas = os.getcwd()
+
+        # Nombre único
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         base = f"informe_{rut}_{ts}"
         if exportar_solo_seleccion:
             base += f"_sel{len(filas)}"
 
-        # Elegir destino
-        ruta = filedialog.asksaveasfilename(
-            title="Guardar informe",
-            defaultextension=".xlsx",
-            filetypes=[("Excel (*.xlsx)", "*.xlsx"), ("CSV (*.csv)", "*.csv")],
-            initialfile=f"{base}.xlsx"
-        )
-        if not ruta:
-            return
-
-        # Si eligen CSV o no hay openpyxl → CSV con ;
-        if ruta.lower().endswith(".csv") or Workbook is None:
-            if Workbook is None and ruta.lower().endswith(".xlsx"):
-                messagebox.showinfo(
-                    "Sin openpyxl",
-                    "No encontré 'openpyxl'. Exportaré en CSV con separador ';' para Excel."
+        # Elegir extensión según disponibilidad de openpyxl
+        if Workbook is not None:
+            ruta = os.path.join(carpeta_descargas, f"{base}.xlsx")
+            ruta = _ruta_unica(ruta)
+            try:
+                _exportar_xlsx(
+                    ruta, filas, rut,
+                    nombre_funcionario=nombre_funcionario,
+                    rango_legible=rango_legible,
+                    solo_seleccion=exportar_solo_seleccion
                 )
-                ruta = ruta.rsplit(".", 1)[0] + ".csv"
-            _exportar_csv(ruta, filas, rut)
-            return
-
-        # Excel bonito. Intentamos con la versión nueva (con resumen mejorado);
-        # si tu _exportar_xlsx aún tiene la firma vieja, hacemos fallback.
-        try:
-            _exportar_xlsx(
-                ruta, filas, rut,
-                nombre_funcionario=nombre_funcionario,
-                rango_legible=rango_legible,
-                solo_seleccion=exportar_solo_seleccion
+                try:
+                    os.startfile(ruta)  # Windows
+                except Exception:
+                    pass
+            except Exception as e:
+                messagebox.showerror("Error al exportar Excel", str(e))
+                return
+        else:
+            # Fallback a CSV
+            ruta = os.path.join(carpeta_descargas, f"{base}.csv")
+            ruta = _ruta_unica(ruta)
+            messagebox.showinfo(
+                "Sin openpyxl",
+                "No encontré 'openpyxl'. Exportaré en CSV con separador ';' para Excel."
             )
-        except TypeError:
-            # Fallback si no actualizaste la firma de _exportar_xlsx
-            _exportar_xlsx(ruta, filas, rut)
+            try:
+                _exportar_csv(ruta, filas, rut)
+                try:
+                    os.startfile(ruta)  # Windows
+                except Exception:
+                    pass
+            except Exception as e:
+                messagebox.showerror("Error al exportar CSV", str(e))
+                return
 
-
+        messagebox.showinfo("Exportación exitosa", f"El informe se guardó en:\n{ruta}")
 
     def _ruta_unica(path: str) -> str:
-        import os
         base, ext = os.path.splitext(path)
         i = 1
         out = path
@@ -146,7 +159,6 @@ def construir_dia_administrativo(frame_padre):
             out = f"{base} ({i}){ext}"
             i += 1
         return out
-
 
     def _categoria_motivo(motivo: str) -> str:
         s = (motivo or "").lower()
@@ -176,9 +188,7 @@ def construir_dia_administrativo(frame_padre):
             return "Licencia Médica"
         return "Otros permisos"
 
-
     def _exportar_csv(ruta, filas, rut):
-        import csv
         try:
             with open(ruta, "w", newline="", encoding="utf-8-sig") as f:
                 w = csv.writer(f, delimiter=';')
@@ -186,10 +196,8 @@ def construir_dia_administrativo(frame_padre):
                 for id_, fecha_iso, motivo in filas:
                     fecha_legible = datetime.strptime(fecha_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
                     w.writerow([rut, id_, fecha_legible, motivo or ""])
-            messagebox.showinfo("Exportación exitosa", f"Informe CSV exportado en:\n{ruta}")
         except Exception as e:
-            messagebox.showerror("Error al exportar CSV", str(e))
-
+            raise
 
     def _exportar_xlsx(ruta, filas, rut, nombre_funcionario=None, rango_legible="", solo_seleccion=False):
         """
@@ -198,151 +206,142 @@ def construir_dia_administrativo(frame_padre):
         - Panel 'Resumen' al costado (cols F:G) con métricas clave
         - Hoja 'Resumen' con dos tablas: por categoría y por motivo
         """
-        try:
-            from collections import Counter
+        from collections import Counter
 
-            wb = Workbook()
+        wb = Workbook()
 
-            # -------- Hoja Detalle --------
-            ws = wb.active
-            ws.title = "Detalle"
-            headers = ["RUT", "ID", "Fecha", "Motivo"]
-            ws.append(headers)
+        # -------- Hoja Detalle --------
+        ws = wb.active
+        ws.title = "Detalle"
+        headers = ["RUT", "ID", "Fecha", "Motivo"]
+        ws.append(headers)
 
-            # Contadores
-            motivo_counts = Counter()
-            categoria_counts = Counter()
+        # Contadores
+        motivo_counts = Counter()
+        categoria_counts = Counter()
 
-            for id_, fecha_iso, motivo in filas:
-                fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
-                ws.append([rut, id_, fecha_dt, motivo or ""])
-                motivo_counts[motivo or ""] += 1
-                categoria_counts[_categoria_motivo(motivo)] += 1
+        for id_, fecha_iso, motivo in filas:
+            fecha_dt = datetime.strptime(fecha_iso, "%Y-%m-%d")
+            ws.append([rut, id_, fecha_dt, motivo or ""])
+            motivo_counts[motivo or ""] += 1
+            categoria_counts[_categoria_motivo(motivo)] += 1
 
-            # Estilos encabezado
-            header_fill = PatternFill("solid", fgColor="4F81BD")
-            header_font = Font(color="FFFFFF", bold=True)
-            for col in range(1, len(headers) + 1):
-                cell = ws.cell(row=1, column=col)
-                cell.fill = header_fill
-                cell.font = header_font
-                cell.alignment = Alignment(horizontal="center", vertical="center")
+        # Estilos encabezado
+        header_fill = PatternFill("solid", fgColor="4F81BD")
+        header_font = Font(color="FFFFFF", bold=True)
+        for col in range(1, len(headers) + 1):
+            cell = ws.cell(row=1, column=col)
+            cell.fill = header_fill
+            cell.font = header_font
+            cell.alignment = Alignment(horizontal="center", vertical="center")
 
-            # Formato de fecha
-            for row in range(2, ws.max_row + 1):
-                ws.cell(row=row, column=3).number_format = "DD/MM/YYYY"
+        # Formato de fecha
+        for row in range(2, ws.max_row + 1):
+            ws.cell(row=row, column=3).number_format = "DD/MM/YYYY"
 
-            # Autofiltro y fijar encabezado
-            ws.auto_filter.ref = f"A1:D{ws.max_row}"
-            ws.freeze_panes = "A2"
+        # Autofiltro y fijar encabezado
+        ws.auto_filter.ref = f"A1:D{ws.max_row}"
+        ws.freeze_panes = "A2"
 
-            # Ajuste de anchos aproximado
-            from openpyxl.utils import get_column_letter
-            col_max = [len(h) for h in headers]
-            for row in range(2, ws.max_row + 1):
-                v1 = str(ws.cell(row=row, column=1).value or "")
-                v2 = str(ws.cell(row=row, column=2).value or "")
-                v3v = ws.cell(row=row, column=3).value
-                v3 = v3v.strftime("%d/%m/%Y") if isinstance(v3v, datetime) else (str(v3v) if v3v else "")
-                v4 = str(ws.cell(row=row, column=4).value or "")
-                for i, v in enumerate([v1, v2, v3, v4]):
-                    col_max[i] = max(col_max[i], len(v))
-            for i, width in enumerate(col_max, start=1):
-                ws.column_dimensions[get_column_letter(i)].width = min(width + 2, 60)
+        # Ajuste de anchos aproximado
+        col_max = [len(h) for h in headers]
+        for row in range(2, ws.max_row + 1):
+            v1 = str(ws.cell(row=row, column=1).value or "")
+            v2 = str(ws.cell(row=row, column=2).value or "")
+            v3v = ws.cell(row=row, column=3).value
+            v3 = v3v.strftime("%d/%m/%Y") if isinstance(v3v, datetime) else (str(v3v) if v3v else "")
+            v4 = str(ws.cell(row=row, column=4).value or "")
+            for i, v in enumerate([v1, v2, v3, v4]):
+                col_max[i] = max(col_max[i], len(v))
+        for i, width in enumerate(col_max, start=1):
+            ws.column_dimensions[get_column_letter(i)].width = min(width + 2, 60)
 
-            # -------- Panel de Resumen al costado (col F:G) --------
-            start_col = 6  # F
-            ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=start_col+1)
-            titulo = ws.cell(row=1, column=start_col, value="Resumen")
-            titulo.fill = header_fill
-            titulo.font = header_font
-            titulo.alignment = Alignment(horizontal="center", vertical="center")
+        # -------- Panel de Resumen al costado (col F:G) --------
+        start_col = 6  # F
+        ws.merge_cells(start_row=1, start_column=start_col, end_row=1, end_column=start_col+1)
+        titulo = ws.cell(row=1, column=start_col, value="Resumen")
+        titulo.fill = header_fill
+        titulo.font = header_font
+        titulo.alignment = Alignment(horizontal="center", vertical="center")
 
-            def _put_pair(r, label, value):
-                ws.cell(row=r, column=start_col, value=label).alignment = Alignment(horizontal="left")
-                ws.cell(row=r, column=start_col+1, value=value).alignment = Alignment(horizontal="right")
+        def _put_pair(r, label, value):
+            ws.cell(row=r, column=start_col, value=label).alignment = Alignment(horizontal="left")
+            ws.cell(row=r, column=start_col+1, value=value).alignment = Alignment(horizontal="right")
 
-            fila = 2
-            if nombre_funcionario:
-                _put_pair(fila, "Funcionario", nombre_funcionario); fila += 1
+        fila = 2
+        if nombre_funcionario:
+            _put_pair(fila, "Funcionario", nombre_funcionario); fila += 1
 
-            _put_pair(fila, "RUT", rut); fila += 1
-            _put_pair(fila, "Rango aplicado", (rango_legible or "Todos")); fila += 1
-            _put_pair(fila, "Solo seleccionados", "Sí" if solo_seleccion else "No"); fila += 1
+        _put_pair(fila, "RUT", rut); fila += 1
+        _put_pair(fila, "Rango aplicado", (rango_legible or "Todos")); fila += 1
+        _put_pair(fila, "Solo seleccionados", "Sí" if solo_seleccion else "No"); fila += 1
 
-            limite_admin = 6
-            usados_admin = categoria_counts.get("Día Administrativo", 0)
-            restantes_admin = max(0, limite_admin - usados_admin)
-            total = sum(motivo_counts.values())
-            licencias = categoria_counts.get("Licencia Médica", 0)
-            extras = total - usados_admin  # (licencias se muestra aparte)
+        limite_admin = 6
+        usados_admin = categoria_counts.get("Día Administrativo", 0)
+        restantes_admin = max(0, limite_admin - usados_admin)
+        total = sum(motivo_counts.values())
+        licencias = categoria_counts.get("Licencia Médica", 0)
+        extras = total - usados_admin  # (licencias se muestra aparte)
 
-            resumen_pairs = [
-                ("Total registros", total),
-                ("Días administrativos (usados)", usados_admin),
-                ("Límite anual", limite_admin),
-                ("Restantes", restantes_admin),
-                ("Permisos extras", extras),
-                ("Licencias médicas", licencias),
-            ]
-            for etiqueta, valor in resumen_pairs:
-                _put_pair(fila, etiqueta, valor)
-                fila += 1
-
-            # Subtítulo categorías
-            fila += 1
-            ws.merge_cells(start_row=fila, start_column=start_col, end_row=fila, end_column=start_col+1)
-            sub = ws.cell(row=fila, column=start_col, value="Por categoría")
-            sub.fill = PatternFill("solid", fgColor="D9E1F2")
-            sub.font = Font(bold=True)
-            sub.alignment = Alignment(horizontal="center")
+        resumen_pairs = [
+            ("Total registros", total),
+            ("Días administrativos (usados)", usados_admin),
+            ("Límite anual", limite_admin),
+            ("Restantes", restantes_admin),
+            ("Permisos extras", extras),
+            ("Licencias médicas", licencias),
+        ]
+        for etiqueta, valor in resumen_pairs:
+            _put_pair(fila, etiqueta, valor)
             fila += 1
 
-            for cat, cant in sorted(categoria_counts.items(), key=lambda x: (-x[1], x[0])):
-                _put_pair(fila, cat, cant)
-                fila += 1
+        # Subtítulo categorías
+        fila += 1
+        ws.merge_cells(start_row=fila, start_column=start_col, end_row=fila, end_column=start_col+1)
+        sub = ws.cell(row=fila, column=start_col, value="Por categoría")
+        sub.fill = PatternFill("solid", fgColor="D9E1F2")
+        sub.font = Font(bold=True)
+        sub.alignment = Alignment(horizontal="center")
+        fila += 1
 
-            # Anchos del panel
-            ws.column_dimensions[get_column_letter(start_col)].width = 32   # F
-            ws.column_dimensions[get_column_letter(start_col+1)].width = 14 # G
+        for cat, cant in sorted(categoria_counts.items(), key=lambda x: (-x[1], x[0])):
+            _put_pair(fila, cat, cant)
+            fila += 1
 
-            # -------- Hoja Resumen (2 tablas) --------
-            resumen = wb.create_sheet("Resumen")
+        # Anchos del panel
+        ws.column_dimensions[get_column_letter(start_col)].width = 32   # F
+        ws.column_dimensions[get_column_letter(start_col+1)].width = 14 # G
 
-            # Tabla 1: por categoría
-            resumen.append(["Categoría", "Días"])
-            resumen.cell(row=1, column=1).fill = header_fill
-            resumen.cell(row=1, column=2).fill = header_fill
-            resumen.cell(row=1, column=1).font = header_font
-            resumen.cell(row=1, column=2).font = header_font
-            for cat, cant in sorted(categoria_counts.items(), key=lambda x: (-x[1], x[0])):
-                resumen.append([cat, cant])
-            resumen.auto_filter.ref = f"A1:B{resumen.max_row}"
-            resumen.freeze_panes = "A2"
-            resumen.column_dimensions["A"].width = 45
-            resumen.column_dimensions["B"].width = 12
+        # -------- Hoja Resumen (2 tablas) --------
+        resumen = wb.create_sheet("Resumen")
 
-            # Tabla 2: por motivo (debajo, dejando una fila vacía)
-            inicio2 = resumen.max_row + 2
-            resumen.cell(row=inicio2, column=1, value="Motivo").fill = header_fill
-            resumen.cell(row=inicio2, column=2, value="Días").fill = header_fill
-            resumen.cell(row=inicio2, column=1).font = header_font
-            resumen.cell(row=inicio2, column=2).font = header_font
+        # Tabla 1: por categoría
+        resumen.append(["Categoría", "Días"])
+        resumen.cell(row=1, column=1).fill = header_fill
+        resumen.cell(row=1, column=2).fill = header_fill
+        resumen.cell(row=1, column=1).font = header_font
+        resumen.cell(row=1, column=2).font = header_font
+        for cat, cant in sorted(categoria_counts.items(), key=lambda x: (-x[1], x[0])):
+            resumen.append([cat, cant])
+        resumen.auto_filter.ref = f"A1:B{resumen.max_row}"
+        resumen.freeze_panes = "A2"
+        resumen.column_dimensions["A"].width = 45
+        resumen.column_dimensions["B"].width = 12
 
-            r = inicio2 + 1
-            for mot, cant in sorted(motivo_counts.items(), key=lambda x: (-x[1], x[0])):
-                resumen.cell(row=r, column=1, value=mot)
-                resumen.cell(row=r, column=2, value=cant)
-                r += 1
+        # Tabla 2: por motivo (debajo, dejando una fila vacía)
+        inicio2 = resumen.max_row + 2
+        resumen.cell(row=inicio2, column=1, value="Motivo").fill = header_fill
+        resumen.cell(row=inicio2, column=2, value="Días").fill = header_fill
+        resumen.cell(row=inicio2, column=1).font = header_font
+        resumen.cell(row=inicio2, column=2).font = header_font
 
-            wb.save(ruta)
-            messagebox.showinfo("Exportación exitosa", f"Informe Excel exportado en:\n{ruta}")
-        except Exception as e:
-            messagebox.showerror("Error al exportar Excel", str(e))
+        r = inicio2 + 1
+        for mot, cant in sorted(motivo_counts.items(), key=lambda x: (-x[1], x[0])):
+            resumen.cell(row=r, column=1, value=mot)
+            resumen.cell(row=r, column=2, value=cant)
+            r += 1
 
-
-
-
+        wb.save(ruta)
 
     # --- CONFIGURACIÓN DE PERMISOS Y DÍAS ---
     opciones_permiso = [
@@ -373,10 +372,7 @@ def construir_dia_administrativo(frame_padre):
     frame = ctk.CTkFrame(frame_padre)
     frame.pack(fill="both", expand=True, padx=20, pady=20)
 
-    
-
     ctk.CTkLabel(frame, text="Asignar, Ver o Editar Días Administrativos, Permisos y Licencias", font=("Arial", 18)).pack(pady=10)
-    
 
     # --- CARGA NOMBRES/RUTS Y AUTOCOMPLETADO ---
     def cargar_nombres_ruts():
@@ -498,7 +494,6 @@ def construir_dia_administrativo(frame_padre):
     combo_nombre.bind("<Return>", buscar_por_nombre)
     combo_nombre.bind("<<ComboboxSelected>>", buscar_por_nombre)
 
-    
     def buscar_solicitudes():
         nombre = combo_nombre.get()
         rut_combo = dict_nombre_rut.get(nombre, "")
@@ -525,7 +520,7 @@ def construir_dia_administrativo(frame_padre):
         # Ej.: lunes + 5 corridos (incluyendo lunes) => viernes
         return fecha_inicio + timedelta(days=dias_corridos - 1)
 
-        # ==== Multiselección para eliminar (helpers) ====
+    # ==== Multiselección para eliminar (helpers) ====
     selected_ids = set()
     checkbox_vars = {}
 
@@ -594,8 +589,6 @@ def construir_dia_administrativo(frame_padre):
 
     actualizar_boton_eliminar()  
 
-    
-    
     # ========== FUNCIÓN PARA AUTO-CÁLCULO DE FECHAS ==========
     def actualizar_fecha_hasta_auto(event=None):
         tipo = combo_tipo_permiso.get()
@@ -625,8 +618,6 @@ def construir_dia_administrativo(frame_padre):
         else:
             entry_fecha_hasta.configure(state="normal")
             entry_fecha_hasta.delete(0, tk.END)
-
-
 
     entry_fecha_desde.bind("<FocusOut>", actualizar_fecha_hasta_auto)
     entry_fecha_desde.bind("<Return>", actualizar_fecha_hasta_auto)
@@ -681,7 +672,6 @@ def construir_dia_administrativo(frame_padre):
         if fecha_fin < fecha_inicio:
             messagebox.showerror("Error", "La fecha final no puede ser anterior a la inicial.")
             return
-
 
         conn = sqlite3.connect("reloj_control.db")
         cur = conn.cursor()
@@ -754,8 +744,6 @@ def construir_dia_administrativo(frame_padre):
         width=160
     ).pack(side="left", padx=10)
 
-
-
     # ========== FUNCIÓN PARA CAMBIOS DE PERMISO ==========
     def actualizar_visibilidad_entry_otro(choice):
         entry_fecha_desde.configure(state="normal")
@@ -806,7 +794,6 @@ def construir_dia_administrativo(frame_padre):
 
     chk_auto.configure(command=_on_toggle_auto)
   
-
     # ========== FUNCIONES PRINCIPALES ==========
     def mostrar_vista_previa():
         for widget in tabla_preview.winfo_children():
@@ -875,9 +862,6 @@ def construir_dia_administrativo(frame_padre):
             ctk.CTkButton(tabla_preview, text="❌", width=30, fg_color="red",
                         command=lambda i=id_: eliminar_dia_admin(i)).grid(row=idx, column=4, padx=5)
 
-
-    
-
     def actualizar_motivo(id_, entry_widget):
         nuevo_motivo = entry_widget.get().strip()
         conn = sqlite3.connect("reloj_control.db")
@@ -898,5 +882,3 @@ def construir_dia_administrativo(frame_padre):
         conn.close()
         mostrar_vista_previa()
         messagebox.showinfo("Eliminado", "Día administrativo eliminado correctamente.")
-
-    
