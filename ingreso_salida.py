@@ -137,13 +137,58 @@ def validar_pass_rut(rut: str, clave: str) -> bool:
 
 # ================== VERIFICACIÓN FACIAL ==================
 
-def verificar_rostro(rut):
+# --------- PARÁMETROS DE RECONOCIMIENTO (ajustables) ----------
+FACIAL_TOLERANCE = 0.50      # antes típico ~0.60; más bajo = más estricto
+DISTANCE_MARGIN  = 0.04      # diferencia mínima entre 1º y 2º mejor match
+
+def _ensure_list_encodings(obj):
+    """
+    Acepta tanto un solo encoding (np.array) como una lista de encodings.
+    Retorna siempre una lista [encoding, ...].
+    """
+    try:
+        import numpy as np  # noqa: F401 (solo para type-awareness)
+    except ImportError:
+        pass
+    if isinstance(obj, (list, tuple)):
+        return list(obj)
+    return [obj]
+
+def _load_encodings_for_rut(rut: str):
+    """
+    Carga encodings de rostros/<rut>.pkl y los devuelve como lista.
+    """
     archivo_rostro = os.path.join("rostros", f"{rut}.pkl")
     if not os.path.exists(archivo_rostro):
-        return False
-
+        return []
     with open(archivo_rostro, "rb") as f:
-        rostro_guardado = pickle.load(f)
+        data = pickle.load(f)
+    return _ensure_list_encodings(data)
+
+def _load_all_known_encodings():
+    """
+    Carga TODOS los encodings de la carpeta rostros/.
+    Devuelve (encodings_list, rut_por_encoding_list).
+    Si un .pkl trae varios encodings, se agregan todos.
+    """
+    encs, ruts = [], []
+    for archivo in os.listdir("rostros"):
+        if not archivo.endswith(".pkl"):
+            continue
+        rut = archivo[:-4]
+        for enc in _load_encodings_for_rut(rut):
+            encs.append(enc)
+            ruts.append(rut)
+    return encs, ruts
+
+def verificar_rostro(rut):
+    """
+    Verifica un RUT específico: compara la cara capturada con las
+    muestras guardadas SOLO de esa persona. No fuerza coincidencias.
+    """
+    expected_encs = _load_encodings_for_rut(rut)
+    if not expected_encs:
+        return False
 
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
@@ -158,14 +203,21 @@ def verificar_rostro(rut):
             continue
 
         if not instrucciones_mostradas:
-            cv2.putText(frame, "Mire al frente sin moverse", (40, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
+            cv2.putText(frame, "Mire al frente sin moverse", (40, 40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
             instrucciones_mostradas = True
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         rostros = face_recognition.face_encodings(rgb)
 
-        for rostro in rostros:
-            if face_recognition.compare_faces([rostro_guardado], rostro)[0]:
+        if rostros:
+            if len(rostros) > 1:
+                cv2.putText(frame, "Por favor, solo 1 persona frente a la camara", (40, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+            cand = rostros[0]
+            dists = face_recognition.face_distance(expected_encs, cand)
+            best = float(min(dists)) if len(dists) else 1.0
+            if best <= FACIAL_TOLERANCE:
                 verificado = True
                 break
 
@@ -178,11 +230,27 @@ def verificar_rostro(rut):
     return verificado
 
 def reconocer_rostro_sin_rut():
+    """
+    Reconocimiento abierto (sin RUT ingresado).
+    Selecciona el mejor candidato PERO solo lo acepta si:
+      - la distancia está bajo FACIAL_TOLERANCE, y
+      - existe margen suficiente vs el segundo mejor (DISTANCE_MARGIN).
+    Si no hay seguridad, retorna None (para caer al flujo de emergencia).
+    """
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         return None
 
+    known_encs, rut_map = _load_all_known_encodings()
+    if not known_encs:
+        cap.release()
+        return None
+
+    import numpy as np
+    known_matrix = np.vstack(known_encs)
+
     rostro_detectado = None
+
     for _ in range(60):
         ret, frame = cap.read()
         if not ret:
@@ -192,15 +260,25 @@ def reconocer_rostro_sin_rut():
         rostros_en_vivo = face_recognition.face_encodings(rgb)
 
         if rostros_en_vivo:
-            rostro_actual = rostros_en_vivo[0]
-            for archivo in os.listdir("rostros"):
-                if archivo.endswith(".pkl"):
-                    rut_archivo = archivo.replace(".pkl", "")
-                    with open(os.path.join("rostros", archivo), "rb") as f:
-                        rostro_guardado = pickle.load(f)
-                    if face_recognition.compare_faces([rostro_guardado], rostro_actual)[0]:
-                        rostro_detectado = rut_archivo
-                        break
+            if len(rostros_en_vivo) > 1:
+                cv2.putText(frame, "Por favor, solo 1 persona frente a la camara", (40, 80),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+            cand = rostros_en_vivo[0]
+            dists = face_recognition.face_distance(known_matrix, cand)
+
+            idxs = np.argsort(dists)
+            best_idx = int(idxs[0])
+            best_dist = float(dists[best_idx])
+            second_best = float(dists[idxs[1]]) if len(dists) > 1 else None
+
+            seguro = (best_dist <= FACIAL_TOLERANCE) and \
+                     (second_best is None or (second_best - best_dist) >= DISTANCE_MARGIN)
+
+            if seguro:
+                rostro_detectado = rut_map[best_idx]
+            else:
+                rostro_detectado = None  # explícitamente incierto
 
         cv2.imshow("Reconocimiento Automático", cv2.resize(frame, (800, 600)))
         if cv2.waitKey(1) & 0xFF == ord('q') or rostro_detectado:

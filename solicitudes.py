@@ -36,9 +36,8 @@ os.makedirs(SALIDA_PDF_DIR, exist_ok=True)
 # -------------------- Email --------------------
 DESTINATARIOS = [
     "dennis.flores@slepllanquihue.cl",
-    "marcelo.vargas@slepllanquihue.cl",
-    "liceo.icpfrutillar@slepllanquihue.cl",
-    "natalia.negron@slepllanquihue.cl",
+    
+    
 ]
 
 # Cuenta oficial BioAccess (SMTP SSL directo 465)
@@ -168,7 +167,9 @@ def obtener_cargo_por_rut(rut: str) -> str:
 # =========================================================
 opciones_permiso = [
     "Elija tipo de Solicitud o Permiso",
-    "Día Administrativo",
+    "Día Administrativo (Día Completo)",
+    "Día Administrativo (Medio Día)",
+    "Día Administrativo (Horas)",
     "Permiso por Matrimonio/Acuerdo Unión Civil (5 días hábiles)",
     "Permiso por Defunción de Hijo (10 días corridos)",
     "Permiso por Defunción de Cónyuge/Conviviente Civil (7 días corridos)",
@@ -217,13 +218,17 @@ def completar_pdf_campos(entrada_pdf: str, salida_pdf: str, campos: dict):
     reader = PdfReader(entrada_pdf)
     writer = PdfWriter()
     writer.append_pages_from_reader(reader)
-    if "/AcroForm" in reader.trailer["/Root"]:
-        writer._root_object.update({"/AcroForm": reader.trailer["/Root"]["/AcroForm"]})
+
+    root = reader.trailer.get("/Root", {})
+    if "/AcroForm" in root:
+        writer._root_object.update({"/AcroForm": root["/AcroForm"]})
         writer._root_object["/AcroForm"].update({"/NeedAppearances": True})
         fields = writer.get_fields() or {}
         to_update = {k: str(v) for k, v in campos.items() if k in fields}
         if to_update:
             writer.update_page_form_field_values(writer.pages, to_update)
+
+
     with open(salida_pdf, "wb") as f:
         writer.write(f)
 
@@ -290,7 +295,7 @@ def construir_solicitudes(frame_padre, on_volver=None):
     form.grid(row=1, column=0, sticky="n")
 
     # Más padding vertical entre filas
-    for i in range(0, 8):
+    for i in range(0, 12):
         form.grid_rowconfigure(i, pad=10)
 
     # Labels con más espacio a la derecha
@@ -324,7 +329,7 @@ def construir_solicitudes(frame_padre, on_volver=None):
     cmb_tipo.set(opciones_permiso[0])
     cmb_tipo.grid(row=3, column=1, columnspan=2, sticky="w")
 
-    # ---- Fechas (ahora en filas separadas)
+    # ---- Fechas (en filas separadas)
     ctk.CTkLabel(form, text="Desde (dd-mm-yy):", width=LABEL_W, anchor="e").grid(row=4, column=0, sticky="e", padx=LABEL_PADX)
     if HAS_TKCAL:
         entry_desde = DateEntry(form, date_pattern="dd-mm-yy", width=14)
@@ -339,10 +344,53 @@ def construir_solicitudes(frame_padre, on_volver=None):
         entry_hasta = ctk.CTkEntry(form, placeholder_text="dd-mm-yy", width=140)
     entry_hasta.grid(row=5, column=1, sticky="w")
 
+    # ================= BLOQUE: Día Administrativo (Horas) =================
+    # Siempre visible, pero editable solo cuando corresponda
+    frame_horas = ctk.CTkFrame(form)
+    frame_horas.grid(row=6, column=0, columnspan=3, sticky="w", padx=0, pady=(0, 0))
+
+    # Cantidad de horas
+    lbl_cant = ctk.CTkLabel(frame_horas, text="Cantidad de horas:", width=LABEL_W, anchor="e")
+    lbl_cant.grid(row=0, column=0, sticky="e", padx=LABEL_PADX)
+    horas_values = [str(i) for i in range(1, 11)]
+    cmb_cantidad_horas = ctk.CTkOptionMenu(frame_horas, values=horas_values, width=100)
+    cmb_cantidad_horas.set(horas_values[0])
+    cmb_cantidad_horas.grid(row=0, column=1, sticky="w")
+
+    # Hora inicio
+    lbl_inicio = ctk.CTkLabel(frame_horas, text="Hora inicio (HH:MM):", width=LABEL_W, anchor="e")
+    lbl_inicio.grid(row=1, column=0, sticky="e", padx=LABEL_PADX, pady=(8, 0))
+    entry_hora_inicio = ctk.CTkEntry(frame_horas, placeholder_text="HH:MM", width=120)
+    entry_hora_inicio.grid(row=1, column=1, sticky="w", pady=(8, 0))
+
+    # Hora término (auto)
+    lbl_fin = ctk.CTkLabel(frame_horas, text="Hora término (HH:MM):", width=LABEL_W, anchor="e")
+    lbl_fin.grid(row=2, column=0, sticky="e", padx=LABEL_PADX, pady=(8, 0))
+    entry_hora_fin = ctk.CTkEntry(frame_horas, placeholder_text="HH:MM", width=120)
+    entry_hora_fin.grid(row=2, column=1, sticky="w", pady=(8, 0))
+    entry_hora_fin.configure(state="disabled")
+
+    def _set_estado_horas(enabled: bool):
+        estado = "normal" if enabled else "disabled"
+        cmb_cantidad_horas.configure(state=estado)
+        entry_hora_inicio.configure(state=estado)
+        entry_hora_fin.configure(state="disabled")  # siempre de solo lectura
+        if not enabled:
+            # limpiar campos si se deshabilita
+            cmb_cantidad_horas.set(horas_values[0])
+            entry_hora_inicio.delete(0, "end")
+            entry_hora_fin.configure(state="normal")
+            entry_hora_fin.delete(0, "end")
+            entry_hora_fin.configure(state="disabled")
+
+    # Arranca deshabilitado (visible pero no editable)
+    _set_estado_horas(False)
+
     # ---- Observación
-    ctk.CTkLabel(form, text="Observación:", width=LABEL_W, anchor="e").grid(row=6, column=0, sticky="e", padx=LABEL_PADX)
+    ctk.CTkLabel(form, text="Observación:", width=LABEL_W, anchor="e").grid(row=7, column=0, sticky="e", padx=LABEL_PADX)
     entry_obs = ctk.CTkEntry(form, placeholder_text="Motivo u observación (opcional)", width=480)
-    entry_obs.grid(row=6, column=1, columnspan=2, sticky="w")
+    entry_obs.grid(row=7, column=1, columnspan=2, sticky="w")
+    # ===========================================================================
 
     # ---- Nota aclaratoria (fuente +1 → 13)
     nota = ctk.CTkLabel(
@@ -388,7 +436,7 @@ def construir_solicitudes(frame_padre, on_volver=None):
             combo_nombre.configure(values=primeros_10)
         else:
             filtrados = [n for n in lista_nombres if t in n.lower()]
-            combo_nombre.configure(values=(filtrados[:10] if filtrados else ["No encontrado"]))
+            combo_nombre.configure(values=(filtrados[:10] if filtrados else ["No encontrado"]));
     combo_nombre.bind("<KeyRelease>", autocompletar_nombres)
 
     def _rellenar_por_rut(rut: str):
@@ -467,7 +515,57 @@ def construir_solicitudes(frame_padre, on_volver=None):
         entry_desde.bind("<<DateEntrySelected>>", _auto_hasta)
     else:
         entry_desde.bind("<FocusOut>", _auto_hasta)
-    cmb_tipo.configure(command=lambda *_: _auto_hasta())
+    # (cmb_tipo command se conecta más abajo)
+
+    # ================= Cálculo automático de hora término =================
+    def _parse_hhmm(txt: str) -> datetime.time | None:
+        txt = (txt or "").strip()
+        try:
+            return datetime.datetime.strptime(txt, "%H:%M").time()
+        except Exception:
+            return None
+
+    def _calc_hora_fin():
+        """Calcula y coloca la hora término según inicio + cantidad horas."""
+        if entry_hora_inicio.cget("state") == "disabled":
+            return
+        h_ini = _parse_hhmm(entry_hora_inicio.get())
+        if not h_ini:
+            # limpiar fin si inicio no válido
+            entry_hora_fin.configure(state="normal")
+            entry_hora_fin.delete(0, "end")
+            entry_hora_fin.configure(state="disabled")
+            return
+        try:
+            cant = int(cmb_cantidad_horas.get())
+        except Exception:
+            cant = 1
+        base_date = datetime.date(2000, 1, 1)
+        dt_ini = datetime.datetime.combine(base_date, h_ini)
+        dt_fin = dt_ini + datetime.timedelta(hours=cant)
+        hhmm = dt_fin.strftime("%H:%M")
+        entry_hora_fin.configure(state="normal")
+        entry_hora_fin.delete(0, "end")
+        entry_hora_fin.insert(0, hhmm)
+        entry_hora_fin.configure(state="disabled")
+
+    # Eventos que recalculan
+    cmb_cantidad_horas.configure(command=lambda *_: _calc_hora_fin())
+    entry_hora_inicio.bind("<FocusOut>", lambda *_: _calc_hora_fin())
+    entry_hora_inicio.bind("<KeyRelease>", lambda *_: _calc_hora_fin())
+
+    # ---------- Habilitar/Deshabilitar bloque horas según tipo (sin ocultar) ----------
+    def _on_tipo_change(*_):
+        tipo_sel = cmb_tipo.get().strip()
+        _auto_hasta()
+        if tipo_sel == "Día Administrativo (Horas)":
+            _set_estado_horas(True)   # habilitar edición
+        else:
+            _set_estado_horas(False)  # mantener visible pero no editable
+
+    # Conectar cambio de tipo y aplicar estado inicial
+    cmb_tipo.configure(command=lambda *_: _on_tipo_change())
+    _on_tipo_change()
 
     # ---------- Validación ----------
     def validar_llenado():
@@ -489,6 +587,16 @@ def construir_solicitudes(frame_padre, on_volver=None):
             faltantes.append("Fecha Hasta (dd-mm-yy)")
         if d and h and d > h:
             faltantes.append("Rango de fechas inválido (Desde > Hasta)")
+
+        # Validaciones extra si es por horas
+        if tipo == "Día Administrativo (Horas)":
+            h_ini = _parse_hhmm(entry_hora_inicio.get())
+            if h_ini is None:
+                faltantes.append("Hora inicio (HH:MM)")
+            # Asegurar que hora fin esté calculada
+            val_fin = entry_hora_fin.get().strip()
+            if not val_fin:
+                faltantes.append("Hora término (auto)")
         return faltantes
 
     # ---------- Enviar ----------
@@ -505,7 +613,22 @@ def construir_solicitudes(frame_padre, on_volver=None):
         d = _get_date_from_widget(entry_desde)
         h = _get_date_from_widget(entry_hasta)
         obs = entry_obs.get().strip()
-        hoy = datetime.date.today()
+
+        # Si es por horas, anexar detalles a la observación y asegurar cálculo fin
+        detalle_horas = ""
+        if tipo == "Día Administrativo (Horas)":
+            try:
+                cant = int(cmb_cantidad_horas.get())
+            except Exception:
+                cant = 1
+            hora_ini_txt = entry_hora_inicio.get().strip()
+            _calc_hora_fin()
+            hora_fin_txt = entry_hora_fin.get().strip()
+            detalle_horas = f" [Horas: {cant}, Inicio: {hora_ini_txt}, Término: {hora_fin_txt}]"
+            if obs:
+                obs = obs + detalle_horas
+            else:
+                obs = detalle_horas.strip()
 
         try:
             folio = get_next_folio()
@@ -555,6 +678,7 @@ def construir_solicitudes(frame_padre, on_volver=None):
             entry_desde.delete(0, "end")
             entry_hasta.delete(0, "end")
         entry_obs.delete(0, "end")
+        _set_estado_horas(False)
     btn_limpiar.configure(command=do_limpiar)
 
     def do_cancelar():
