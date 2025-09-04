@@ -108,8 +108,14 @@ def mostrar_nomina():
 def mostrar_editar_usuario():
     limpiar_frame()
     from editar_usuario import construir_edicion
-    construir_edicion(frame_contenedor, actualizar_contador)
-
+    construir_edicion(
+        frame_contenedor,
+        on_actualizacion=actualizar_contador,              # sigue refrescando el contador
+        on_volver_inicio=lambda: [                         # <<--- ESTA LÍNEA ES LA CLAVE
+            mostrar_ingreso_salida(),                      # vuelve a la pantalla de Ingreso/Salida
+            resaltar_boton_activo("ingreso")               # y marca el botón activo
+        ]
+    )
 # ========== Ventana de Bienvenida (moderna, centrada, fade-in, autocierre) ==========
 def mostrar_bienvenida(nombre: str, autoclose_ms: int = 2500):
     TopLevelCls = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
@@ -147,6 +153,7 @@ def mostrar_bienvenida(nombre: str, autoclose_ms: int = 2500):
     x = app.winfo_x() + (app.winfo_width() // 2) - (w // 2)
     y = app.winfo_y() + (app.winfo_height() // 2) - (h // 2)
     win.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
+    
 
     # Fade-in seguro
     try:

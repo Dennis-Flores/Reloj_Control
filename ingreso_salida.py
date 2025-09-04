@@ -786,6 +786,14 @@ def construir_ingreso_salida(frame_padre):
             x = master.winfo_x() + (master.winfo_width() // 2) - (w // 2)
             y = master.winfo_y() + (master.winfo_height() // 2) - (h // 2)
             win.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
+            try:
+                win.minsize(680, 480)
+                win.lift()
+                win.attributes("-topmost", True)
+                win.after(50, lambda: win.attributes("-topmost", False))
+            except Exception:
+                pass
+
             win.bind("<Return>", lambda e: confirmar())
             win.bind("<Escape>", lambda e: win.destroy())
             win.after(80, focus_text)

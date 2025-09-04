@@ -190,71 +190,114 @@ def _matrix_to_text(matrix, header=True):
     return "\n".join(lines)
 
 def _matrix_to_html(nombre, rut, profesion, correo, cumple, matrix, ignored=0):
+    """HTML claro, alto contraste y estilos inline (robustos ante dark-mode)."""
+    gen = datetime.now().strftime("%d-%m-%Y %H:%M")
+    # Estilos base (inline-friendly)
+    CARD_BG   = "#ffffff"
+    PAGE_BG   = "#f3f4f6"
+    TEXT      = "#111827"
+    MUTED     = "#6b7280"
+    BORDER    = "#e5e7eb"
+    ACCENT    = "#0b5ea8"   # azul corporativo
+    TH_BG     = ACCENT
+    TH_TXT    = "#ffffff"
+    SUB_BG    = "#eaf2fb"   # subtítulos en claro
+    ROW_EVEN  = "#ffffff"
+    ROW_ODD   = "#f9fafb"
+
+    def td(val):
+        return f'<td style="padding:8px;border:1px solid {BORDER};text-align:center;color:{TEXT}">{val}</td>'
+
+    def c(val):
+        if val == "-":
+            return td("--:--") + td("--:--")
+        he, hs = val
+        return td(he) + td(hs)
+
     rows = []
-    for d in DAYS_ORDER:
+    for i, d in enumerate(DAYS_ORDER):
+        bg = ROW_EVEN if i % 2 == 0 else ROW_ODD
         m = matrix[d]
-        def c(val):
-            if val == "-":
-                return "<td>--:--</td><td>--:--</td>"
-            he, hs = val
-            return f"<td>{he}</td><td>{hs}</td>"
         rows.append(
-            f"<tr><th class='day'>{d}</th>{c(m['Mañana'])}{c(m['Tarde'])}{c(m['Nocturna'])}</tr>"
+            f"<tr style='background:{bg}'>"
+            f"<th style='text-align:left;padding:8px;border:1px solid {BORDER};color:{MUTED};background:{bg};width:140px;font-weight:600'>{d}</th>"
+            f"{c(m['Mañana'])}{c(m['Tarde'])}{c(m['Nocturna'])}"
+            "</tr>"
         )
-    warn = f"<p class='warn'>Se ignoraron {ignored} fila(s) vacía(s) del horario.</p>" if ignored else ""
+
+    # --- Badge especial para correo: fondo claro + link con color controlado ---
+    if correo and correo != "-":
+        email_badge = (
+            "<span style=\"display:inline-block;background:#eaf2fb;border:1px solid #bfd6f7;"
+            "color:{0};border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px\">"
+            "Correo: <a href=\"mailto:{1}\" style=\"color:{0};text-decoration:underline\">{1}</a>"
+            "</span>"
+        ).format(ACCENT, correo)
+    else:
+        email_badge = (
+            "<span style=\"display:inline-block;background:#eaf2fb;border:1px solid #bfd6f7;"
+            "color:{0};border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px\">"
+            "Correo: -</span>"
+        ).format(ACCENT)
+
+    warn = (f"<p style='margin:8px 0 0 0;color:#b45309'>"
+            f"Se ignoraron {ignored} fila(s) vacía(s) del horario."
+            f"</p>") if ignored else ""
+
     html = f"""<!doctype html>
 <html lang="es"><meta charset="utf-8">
-<head>
-<title>Horario {nombre} ({rut})</title>
-<style>
-  body{{font-family:Arial,Helvetica,sans-serif;background:#111827;color:#e5e7eb;padding:24px}}
-  .card{{background:#1f2937;border-radius:12px;padding:16px;max-width:900px;margin:0 auto}}
-  h1{{margin:0 0 6px 0;font-size:20px}}
-  h2{{margin:0 0 16px 0;font-size:16px;color:#93c5fd}}
-  table{{border-collapse:collapse;width:100%;background:#111827}}
-  th,td{{border:1px solid #374151;padding:8px;text-align:center}}
-  thead th{{background:#0b5ea8;color:white}}
-  thead .sub{{background:#1f2937;color:#e5e7eb}}
-  th.day{{text-align:left;background:#111827;color:#a3a3a3;width:120px}}
-  .meta{{margin-bottom:12px;line-height:1.6}}
-  .badge{{display:inline-block;background:#2563eb;color:white;border-radius:8px;padding:2px 8px;font-size:12px;margin-right:6px}}
-  .muted{{color:#9ca3af}}
-  .warn{{color:#fbbf24}}
-</style>
-</head>
-<body>
-<div class="card">
-  <h1>Horario de {nombre}</h1>
-  <div class="meta">
-    <span class="badge">RUT: {rut}</span>
-    <span class="badge">Cargo: {profesion}</span>
-    <span class="badge">Correo: {correo}</span>
-    <span class="badge">Cumple: {cumple}</span>
+<body style="margin:0;padding:24px;background:{PAGE_BG};color:{TEXT};font-family:Arial,Helvetica,sans-serif">
+  <div style="max-width:900px;margin:0 auto;background:{CARD_BG};border:1px solid {BORDER};border-radius:12px;padding:20px;box-sizing:border-box">
+    <h1 style="margin:0 0 8px 0;font-size:22px;color:{TEXT}">Horario de {nombre}</h1>
+
+    <!-- Mensaje profesional -->
+    <p style="margin:8px 0 14px 0;line-height:1.55;color:{TEXT}">
+      Estimado(a), junto con saludar, se remite el detalle de horario vigente del funcionario indicado más abajo.
+      Este informe es generado automáticamente por <strong>BioAccess – Control de Horarios</strong> y tiene fines informativos internos.
+      En caso de dudas o discrepancias, por favor responda a este mismo correo para su revisión.
+    </p>
+
+    <div style="margin:0 0 12px 0;line-height:1.7">
+      <span style="display:inline-block;background:{ACCENT};color:{TH_TXT};border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px">RUT: {rut}</span>
+      <span style="display:inline-block;background:{ACCENT};color:{TH_TXT};border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px">Cargo: {profesion}</span>
+      {email_badge}
+      <span style="display:inline-block;background:{ACCENT};color:{TH_TXT};border-radius:8px;padding:4px 10px;font-size:12px">Cumple: {cumple}</span>
+    </div>
+
+    {warn}
+
+    <table role="table" style="border-collapse:collapse;width:100%;background:{CARD_BG};border:1px solid {BORDER}">
+      <thead>
+        <tr>
+          <th style="background:{TH_BG};color:{TH_TXT};padding:10px;border:1px solid {BORDER};text-align:left;width:140px">Día</th>
+          <th colspan="2" style="background:{TH_BG};color:{TH_TXT};padding:10px;border:1px solid {BORDER};text-align:center">MAÑANA</th>
+          <th colspan="2" style="background:{TH_BG};color:{TH_TXT};padding:10px;border:1px solid {BORDER};text-align:center">TARDE</th>
+          <th colspan="2" style="background:{TH_BG};color:{TH_TXT};padding:10px;border:1px solid {BORDER};text-align:center">NOCTURNA</th>
+        </tr>
+        <tr>
+          <th style="background:{SUB_BG};color:{TEXT};padding:8px;border:1px solid {BORDER};text-align:left"></th>
+          <th style="background:{SUB_BG};color:{TEXT};padding:8px;border:1px solid {BORDER};text-align:center">Entrada</th>
+          <th style="background:{SUB_BG};color:{TEXT};padding:8px;border:1px solid {BORDER};text-align:center">Salida</th>
+          <th style="background:{SUB_BG};color:{TEXT};padding:8px;border:1px solid {BORDER};text-align:center">Entrada</th>
+          <th style="background:{SUB_BG};color:{TEXT};padding:8px;border:1px solid {BORDER};text-align:center">Salida</th>
+          <th style="background:{SUB_BG};color:{TEXT};padding:8px;border:1px solid {BORDER};text-align:center">Entrada</th>
+          <th style="background:{SUB_BG};color:{TEXT};padding:8px;border:1px solid {BORDER};text-align:center">Salida</th>
+        </tr>
+      </thead>
+      <tbody>
+        {''.join(rows)}
+      </tbody>
+    </table>
+
+    <p style="margin:14px 0 0 0;color:{MUTED};font-size:12px">
+      Generado el {gen}. Sistema BioAccess – www.bioaccess.cl
+    </p>
   </div>
-  {warn}
-  <table>
-    <thead>
-      <tr>
-        <th rowspan="2">Día</th>
-        <th colspan="2">MAÑANA</th>
-        <th colspan="2">TARDE</th>
-        <th colspan="2">NOCTURNA</th>
-      </tr>
-      <tr class="sub">
-        <th>Entrada</th><th>Salida</th>
-        <th>Entrada</th><th>Salida</th>
-        <th>Entrada</th><th>Salida</th>
-      </tr>
-    </thead>
-    <tbody>
-      {''.join(rows)}
-    </tbody>
-  </table>
-  <p class="muted">Generado por BioAccess.</p>
-</div>
 </body>
 </html>"""
     return html
+
+
 
 def _save_html_and_open(nombre, rut, profesion, correo, cumple, matrix, ignored=0, open_after=True):
     html = _matrix_to_html(nombre, rut, profesion, correo, cumple, matrix, ignored)
@@ -772,17 +815,30 @@ def construir_nomina(frame_padre):
 
             matrix_txt = _matrix_to_text(matrix)
             html_body = _matrix_to_html(nombre_comp, rut, profesion, correo, cumple, matrix, ignored=ignored)
-            text_body = (
-                f"Horario de {nombre_comp} ({rut})\n"
-                f"Cargo: {profesion} | Correo: {correo} | Cumple: {cumple}\n\n"
-                f"{matrix_txt}\n\nGenerado por BioAccess."
+
+            # ======= NUEVO: texto profesional + sello de generación =======
+            gen = datetime.now().strftime("%d-%m-%Y %H:%M")
+            intro = (
+                "Estimado(a), junto con saludar, se remite el detalle de horario vigente.\n"
+                "Este informe es generado automáticamente por BioAccess – Control de Horarios.\n"
+                "Si detecta alguna discrepancia, por favor responda a este mismo correo.\n"
             )
-            subject = f"Horario - {nombre_comp} ({rut})"
+            text_body = (
+                f"{intro}\n"
+                f"Funcionario: {nombre_comp} ({rut})\n"
+                f"Cargo: {profesion} | Correo: {correo} | Cumple: {cumple}\n"
+                f"Generado: {gen}\n\n"
+                f"{matrix_txt}\n\n"
+                f"BioAccess."
+            )
+            # (opcional) cambia el asunto si prefieres
+            subject = f"Horario vigente – {nombre_comp} ({rut})"
 
             ok = _send_email(SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT,
-                             to_list, cc_list, subject, text_body, html_body)
+                            to_list, cc_list, subject, text_body, html_body)
             if ok:
                 tk.messagebox.showinfo("Correo", "Horario enviado correctamente.")
+
 
         btn_export.configure(command=do_export)
         btn_print.configure(command=do_print)

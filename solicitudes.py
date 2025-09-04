@@ -1,5 +1,5 @@
 # solicitudes.py
-import os, sys, sqlite3, datetime, mimetypes, smtplib
+import os, sys, sqlite3, datetime, mimetypes, smtplib, ssl, traceback
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import messagebox
@@ -7,12 +7,22 @@ from email.message import EmailMessage
 
 __all__ = ["construir_solicitudes"]
 
-# ---- PDF opcional ----
+# ---- PDF opcional (rellenar formulario existente) ----
 try:
     from PyPDF2 import PdfReader, PdfWriter
 except Exception:
     PdfReader = None
     PdfWriter = None
+
+# ---- PDF opcional (fallback PDF simple) ----
+try:
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+    HAS_REPORTLAB = True
+except Exception:
+    HAS_REPORTLAB = False
 
 # ---- Calendario ----
 try:
@@ -33,18 +43,23 @@ FORM_PATH = os.path.join(FORM_DIR, "SolicitudPermiso.pdf")  # opcional
 SALIDA_PDF_DIR = os.path.join(BASE, "salidas_solicitudes")
 os.makedirs(SALIDA_PDF_DIR, exist_ok=True)
 
-# -------------------- Email --------------------
+# -------------------- Email (destinatarios fijos + fallback SMTP) --------------------
 DESTINATARIOS = [
     "dennis.flores@slepllanquihue.cl",
     
-    
 ]
 
-# Cuenta oficial BioAccess (SMTP SSL directo 465)
-SMTP_HOST = "mail.bioaccess.cl"
-SMTP_PORT = 465
-SMTP_USER = "solicitud_reloj_control@bioaccess.cl"
-SMTP_PASS = "@solicitud2026"
+# Fallback (si no hay config en BD)
+SMTP_FALLBACK = {
+    "host": "mail.bioaccess.cl",
+    "port": 465,              # SSL directo
+    "user": "solicitud_reloj_control@bioaccess.cl",
+    "password": "@solicitud2026",
+    "use_ssl": True,
+    "use_tls": False,
+    "remitente": "solicitud_reloj_control@bioaccess.cl",
+}
+
 USAR_SMTP = True  # True para envío real
 
 # =========================================================
@@ -162,6 +177,25 @@ def obtener_cargo_por_rut(rut: str) -> str:
     finally:
         con.close()
 
+def obtener_correo_por_rut(rut: str) -> str:
+    """Retorna correo del trabajador si existe columna 'correo'."""
+    if not rut:
+        return ""
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    try:
+        cur.execute("PRAGMA table_info(trabajadores)")
+        cols = {c[1].lower() for c in cur.fetchall()}
+        if "correo" not in cols:
+            return ""
+        cur.execute("SELECT correo FROM trabajadores WHERE rut=?", (rut,))
+        row = cur.fetchone()
+        return (row[0] or "").strip() if row else ""
+    except Exception:
+        return ""
+    finally:
+        con.close()
+
 # =========================================================
 #             TIPOS DE PERMISO + AUTOCÓMPUTO
 # =========================================================
@@ -210,7 +244,7 @@ def _add_days_inclusive(start_date: datetime.date, days: int, habiles: bool) -> 
     return d
 
 # =========================================================
-#                    PDF helpers (opcional)
+#                    PDF helpers (rellenar o fallback)
 # =========================================================
 def completar_pdf_campos(entrada_pdf: str, salida_pdf: str, campos: dict):
     if PdfReader is None or PdfWriter is None:
@@ -228,41 +262,245 @@ def completar_pdf_campos(entrada_pdf: str, salida_pdf: str, campos: dict):
         if to_update:
             writer.update_page_form_field_values(writer.pages, to_update)
 
-
     with open(salida_pdf, "wb") as f:
         writer.write(f)
+
+def _pdf_simple_fallback(path_out: str, datos: dict):
+    """Crea un PDF simple si no hay formulario o PyPDF2/llenado falla."""
+    if not HAS_REPORTLAB:
+        return False
+    styles = getSampleStyleSheet()
+    title = styles["Title"]
+    normal = styles["Normal"]
+    elems = []
+    elems.append(Paragraph("Solicitud de Permiso (Reserva)", title))
+    elems.append(Paragraph("Documento informativo; sujeto a validación administrativa.", normal))
+    elems.append(Spacer(0, 8))
+    rows = [
+        ["Folio", f"{datos.get('folio','')}"],
+        ["Nombre", datos.get("nombre","")],
+        ["RUT", datos.get("rut","")],
+        ["Cargo/Profesión", datos.get("cargo","")],
+        ["Tipo de Permiso", datos.get("tipo","")],
+        ["Desde", datos.get("desde","")],
+        ["Hasta", datos.get("hasta","")],
+        ["Detalle/Obs.", datos.get("observacion","") or "-"],
+        ["Generado", datos.get("generado","")],
+    ]
+    tbl = Table(rows, colWidths=[140, 380])
+    tbl.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("BACKGROUND", (0,0), (0,-1), colors.whitesmoke),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+    ]))
+    elems.append(tbl)
+    doc = SimpleDocTemplate(path_out, pagesize=A4, leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36)
+    doc.build(elems)
+    return True
 
 def nombre_archivo_por_formato(fecha: datetime.date, folio: int, usar_ddmmyyyy=True):
     fecha_str = fecha.strftime("%d%m%Y") if usar_ddmmyyyy else fecha.strftime("%Y%m%d")
     return f"{fecha_str}_F{folio:06}.pdf"
 
+def _build_pdf_solicitud(folio: int, rut: str, nombre: str, cargo: str, tipo: str,
+                         desde: datetime.date, hasta: datetime.date, observacion: str) -> str | None:
+    """
+    Intenta:
+      1) Llenar el formulario PDF (si existe y PyPDF2 está disponible).
+      2) Si falla, genera PDF simple (si reportlab está disponible).
+      3) Si todo falla, retorna None.
+    """
+    os.makedirs(SALIDA_PDF_DIR, exist_ok=True)
+    file_out = os.path.join(SALIDA_PDF_DIR, nombre_archivo_por_formato(desde, folio, usar_ddmmyyyy=True))
+    generado = datetime.datetime.now().strftime("%d-%m-%Y %H:%M")
+
+    # Campos candidatos (solo se llenan si existen en el PDF)
+    campos = {
+        "folio": f"{folio:06d}",
+        "Folio": f"{folio:06d}",
+        "RUT": rut,
+        "rut": rut,
+        "Nombre": nombre,
+        "nombre": nombre,
+        "Cargo": cargo,
+        "cargo": cargo,
+        "Tipo": tipo,
+        "tipo": tipo,
+        "Desde": desde.strftime("%d-%m-%Y"),
+        "desde": desde.strftime("%d-%m-%Y"),
+        "Hasta": hasta.strftime("%d-%m-%Y"),
+        "hasta": hasta.strftime("%d-%m-%Y"),
+        "Observacion": observacion or "",
+        "observacion": observacion or "",
+        "FechaEmision": generado.split(" ")[0],
+        "HoraEmision": generado.split(" ")[1],
+    }
+
+    # 1) Intentar llenar formulario
+    try:
+        if FORM_PATH and os.path.exists(FORM_PATH) and PdfReader is not None and PdfWriter is not None:
+            completar_pdf_campos(FORM_PATH, file_out, campos)
+            return file_out
+    except Exception:
+        traceback.print_exc()
+
+    # 2) Fallback PDF simple
+    try:
+        ok = _pdf_simple_fallback(file_out, {
+            "folio": f"{folio:06d}",
+            "rut": rut, "nombre": nombre, "cargo": cargo,
+            "tipo": tipo,
+            "desde": desde.strftime("%d-%m-%Y"),
+            "hasta": hasta.strftime("%d-%m-%Y"),
+            "observacion": observacion or "",
+            "generado": generado,
+        })
+        if ok:
+            return file_out
+    except Exception:
+        traceback.print_exc()
+
+    # 3) Nada
+    return None
+
 # =========================================================
-#                    EMAIL
+#                    EMAIL (config + envío)
 # =========================================================
-def enviar_correo(destinatarios, asunto: str, cuerpo: str, adjunto: str | None = None):
+def _smtp_load_config():
+    """
+    Intenta leer configuración SMTP desde BD:
+      - smtp_config(host,port,user,password,use_tls,use_ssl,remitente) o
+      - parametros_smtp(clave,valor)
+    Si no existe, retorna None (usaremos fallback).
+    """
+    cfg = {}
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        # Opción 1
+        try:
+            cur.execute("SELECT host, port, user, password, use_tls, use_ssl, remitente FROM smtp_config LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                cfg = {
+                    "host": row[0],
+                    "port": int(row[1]) if row[1] else 0,
+                    "user": row[2],
+                    "password": row[3],
+                    "use_tls": str(row[4]).lower() in ("1","true","t","yes","y"),
+                    "use_ssl": str(row[5]).lower() in ("1","true","t","yes","y"),
+                    "remitente": row[6] or row[2],
+                }
+                con.close()
+                return cfg
+        except Exception:
+            pass
+        # Opción 2
+        try:
+            cur.execute("SELECT clave, valor FROM parametros_smtp")
+            rows = cur.fetchall()
+            if rows:
+                m = {k:v for k,v in rows}
+                cfg = {
+                    "host": m.get("host"),
+                    "port": int(m.get("port", "0")),
+                    "user": m.get("user"),
+                    "password": m.get("password"),
+                    "use_tls": str(m.get("use_tls", "true")).lower() in ("1","true","t","yes","y"),
+                    "use_ssl": str(m.get("use_ssl", "false")).lower() in ("1","true","t","yes","y"),
+                    "remitente": m.get("remitente", m.get("user")),
+                }
+                con.close()
+                return cfg
+        except Exception:
+            pass
+        con.close()
+    except Exception:
+        pass
+    return None
+
+def _smtp_send(to_list, cc_list, subject, body_text, html_body=None, attachment_path=None):
     if not USAR_SMTP:
-        info = f"Se habría enviado a: {', '.join(destinatarios)}\n\nASUNTO:\n{asunto}\n\nCUERPO:\n{cuerpo}"
-        if adjunto:
-            info += f"\n\nAdjunto: {adjunto}"
+        info = f"(SIMULADO)\nPara: {', '.join(to_list)}\nCC: {', '.join(cc_list or [])}\nAsunto: {subject}\n\n{body_text}"
         messagebox.showinfo("Envío no configurado", info)
         return
 
+    cfg = _smtp_load_config() or SMTP_FALLBACK
+    host = cfg["host"]
+    port = cfg.get("port") or (465 if cfg.get("use_ssl") else 587)
+    user = cfg.get("user")
+    password = cfg.get("password")
+    use_ssl = cfg.get("use_ssl")
+    use_tls = cfg.get("use_tls")
+    remitente = cfg.get("remitente") or user
+
     msg = EmailMessage()
-    msg["Subject"] = asunto
-    msg["From"] = SMTP_USER
-    msg["To"] = ", ".join(destinatarios)
-    msg.set_content(cuerpo)
+    msg["From"] = remitente
+    msg["To"] = ", ".join([t for t in to_list if t])
+    if cc_list:
+        msg["Cc"] = ", ".join([c for c in cc_list if c])
+    msg["Subject"] = subject or "Solicitud de Permiso (Reserva)"
+    msg.set_content(body_text or "")
 
-    if adjunto and os.path.exists(adjunto):
-        ctype, _ = mimetypes.guess_type(adjunto)
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
+
+    if attachment_path and os.path.exists(attachment_path):
+        ctype, _ = mimetypes.guess_type(attachment_path)
         maintype, subtype = (ctype.split("/", 1) if ctype else ("application", "octet-stream"))
-        with open(adjunto, "rb") as f:
-            msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(adjunto))
+        with open(attachment_path, "rb") as f:
+            msg.add_attachment(f.read(), maintype=maintype, subtype=subtype, filename=os.path.basename(attachment_path))
 
-    # IMPORTANTE: SSL directo en puerto 465
-    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as s:
-        s.login(SMTP_USER, SMTP_PASS)
-        s.send_message(msg)
+    if use_ssl:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=30) as s:
+            if user and password:
+                s.login(user, password)
+            s.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=30) as s:
+            s.ehlo()
+            if use_tls:
+                context = ssl.create_default_context()
+                s.starttls(context=context)
+                s.ehlo()
+            if user and password:
+                s.login(user, password)
+            s.send_message(msg)
+
+def _html_email_solicitud(folio:int, nombre:str, rut:str, cargo:str, tipo:str, desde:str, hasta:str, obs:str):
+    gen = datetime.datetime.now().strftime("%d-%m-%Y %H:%M")
+    PAGE_BG = "#f3f4f6"; CARD_BG = "#ffffff"; TEXT = "#111827"; MUTED="#6b7280"; BORDER="#e5e7eb"; ACCENT="#0b5ea8"
+    obs_html = (obs or "-").replace("\n", "<br>")
+    return f"""<!doctype html>
+<html lang="es"><meta charset="utf-8">
+<body style="margin:0;padding:24px;background:{PAGE_BG};color:{TEXT};font-family:Arial,Helvetica,sans-serif">
+  <div style="max-width:720px;margin:0 auto;background:{CARD_BG};border:1px solid {BORDER};border-radius:12px;padding:20px;box-sizing:border-box">
+    <h1 style="margin:0 0 10px 0;font-size:20px;color:{TEXT}">Reserva de Solicitud</h1>
+    <p style="margin:8px 0 10px 0;line-height:1.55">
+      Se informa nueva <strong>reserva de solicitud</strong> (sujeta a validación administrativa).
+    </p>
+    <div style="margin:8px 0 12px 0;line-height:1.7">
+      <span style="display:inline-block;background:{ACCENT};color:#fff;border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px">Folio: {folio:06d}</span>
+      <span style="display:inline-block;background:#eaf2fb;border:1px solid #bfd6f7;color:{ACCENT};border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px">Tipo: {tipo}</span>
+      <span style="display:inline-block;background:#eaf2fb;border:1px solid #bfd6f7;color:{ACCENT};border-radius:8px;padding:4px 10px;font-size:12px">Periodo: {desde} → {hasta}</span>
+    </div>
+    <table style="width:100%;border-collapse:collapse;border:1px solid {BORDER}">
+      <tr><td style="background:#f8fafc;padding:8px;width:160px">Nombre</td><td style="padding:8px">{nombre}</td></tr>
+      <tr><td style="background:#f8fafc;padding:8px">RUT</td><td style="padding:8px">{rut}</td></tr>
+      <tr><td style="background:#f8fafc;padding:8px">Cargo / Profesión</td><td style="padding:8px">{cargo or "-"}</td></tr>
+      <tr><td style="background:#f8fafc;padding:8px">Observación</td><td style="padding:8px">{obs_html}</td></tr>
+      <tr><td style="background:#f8fafc;padding:8px">Generado</td><td style="padding:8px">{gen}</td></tr>
+    </table>
+    <p style="margin:12px 0 0 0;color:{MUTED};font-size:12px">
+      Nota: esta comunicación es informativa y no reemplaza el formulario oficial firmado.
+    </p>
+  </div>
+</body>
+</html>"""
 
 # =========================================================
 #                    UI PRINCIPAL
@@ -345,11 +583,9 @@ def construir_solicitudes(frame_padre, on_volver=None):
     entry_hasta.grid(row=5, column=1, sticky="w")
 
     # ================= BLOQUE: Día Administrativo (Horas) =================
-    # Siempre visible, pero editable solo cuando corresponda
     frame_horas = ctk.CTkFrame(form)
     frame_horas.grid(row=6, column=0, columnspan=3, sticky="w", padx=0, pady=(0, 0))
 
-    # Cantidad de horas
     lbl_cant = ctk.CTkLabel(frame_horas, text="Cantidad de horas:", width=LABEL_W, anchor="e")
     lbl_cant.grid(row=0, column=0, sticky="e", padx=LABEL_PADX)
     horas_values = [str(i) for i in range(1, 11)]
@@ -357,13 +593,11 @@ def construir_solicitudes(frame_padre, on_volver=None):
     cmb_cantidad_horas.set(horas_values[0])
     cmb_cantidad_horas.grid(row=0, column=1, sticky="w")
 
-    # Hora inicio
     lbl_inicio = ctk.CTkLabel(frame_horas, text="Hora inicio (HH:MM):", width=LABEL_W, anchor="e")
     lbl_inicio.grid(row=1, column=0, sticky="e", padx=LABEL_PADX, pady=(8, 0))
     entry_hora_inicio = ctk.CTkEntry(frame_horas, placeholder_text="HH:MM", width=120)
     entry_hora_inicio.grid(row=1, column=1, sticky="w", pady=(8, 0))
 
-    # Hora término (auto)
     lbl_fin = ctk.CTkLabel(frame_horas, text="Hora término (HH:MM):", width=LABEL_W, anchor="e")
     lbl_fin.grid(row=2, column=0, sticky="e", padx=LABEL_PADX, pady=(8, 0))
     entry_hora_fin = ctk.CTkEntry(frame_horas, placeholder_text="HH:MM", width=120)
@@ -374,25 +608,22 @@ def construir_solicitudes(frame_padre, on_volver=None):
         estado = "normal" if enabled else "disabled"
         cmb_cantidad_horas.configure(state=estado)
         entry_hora_inicio.configure(state=estado)
-        entry_hora_fin.configure(state="disabled")  # siempre de solo lectura
+        entry_hora_fin.configure(state="disabled")
         if not enabled:
-            # limpiar campos si se deshabilita
             cmb_cantidad_horas.set(horas_values[0])
             entry_hora_inicio.delete(0, "end")
             entry_hora_fin.configure(state="normal")
             entry_hora_fin.delete(0, "end")
             entry_hora_fin.configure(state="disabled")
 
-    # Arranca deshabilitado (visible pero no editable)
     _set_estado_horas(False)
 
     # ---- Observación
     ctk.CTkLabel(form, text="Observación:", width=LABEL_W, anchor="e").grid(row=7, column=0, sticky="e", padx=LABEL_PADX)
     entry_obs = ctk.CTkEntry(form, placeholder_text="Motivo u observación (opcional)", width=480)
     entry_obs.grid(row=7, column=1, columnspan=2, sticky="w")
-    # ===========================================================================
 
-    # ---- Nota aclaratoria (fuente +1 → 13)
+    # ---- Nota aclaratoria
     nota = ctk.CTkLabel(
         box,
         text=("⚠️ Esta solicitud NO es oficial. Solo reserva la ausencia y "
@@ -515,7 +746,6 @@ def construir_solicitudes(frame_padre, on_volver=None):
         entry_desde.bind("<<DateEntrySelected>>", _auto_hasta)
     else:
         entry_desde.bind("<FocusOut>", _auto_hasta)
-    # (cmb_tipo command se conecta más abajo)
 
     # ================= Cálculo automático de hora término =================
     def _parse_hhmm(txt: str) -> datetime.time | None:
@@ -531,7 +761,6 @@ def construir_solicitudes(frame_padre, on_volver=None):
             return
         h_ini = _parse_hhmm(entry_hora_inicio.get())
         if not h_ini:
-            # limpiar fin si inicio no válido
             entry_hora_fin.configure(state="normal")
             entry_hora_fin.delete(0, "end")
             entry_hora_fin.configure(state="disabled")
@@ -549,7 +778,6 @@ def construir_solicitudes(frame_padre, on_volver=None):
         entry_hora_fin.insert(0, hhmm)
         entry_hora_fin.configure(state="disabled")
 
-    # Eventos que recalculan
     cmb_cantidad_horas.configure(command=lambda *_: _calc_hora_fin())
     entry_hora_inicio.bind("<FocusOut>", lambda *_: _calc_hora_fin())
     entry_hora_inicio.bind("<KeyRelease>", lambda *_: _calc_hora_fin())
@@ -559,11 +787,11 @@ def construir_solicitudes(frame_padre, on_volver=None):
         tipo_sel = cmb_tipo.get().strip()
         _auto_hasta()
         if tipo_sel == "Día Administrativo (Horas)":
-            _set_estado_horas(True)   # habilitar edición
+            entry_hora_inicio.configure(state="normal")
+            cmb_cantidad_horas.configure(state="normal")
         else:
-            _set_estado_horas(False)  # mantener visible pero no editable
+            _set_estado_horas(False)
 
-    # Conectar cambio de tipo y aplicar estado inicial
     cmb_tipo.configure(command=lambda *_: _on_tipo_change())
     _on_tipo_change()
 
@@ -587,15 +815,11 @@ def construir_solicitudes(frame_padre, on_volver=None):
             faltantes.append("Fecha Hasta (dd-mm-yy)")
         if d and h and d > h:
             faltantes.append("Rango de fechas inválido (Desde > Hasta)")
-
-        # Validaciones extra si es por horas
         if tipo == "Día Administrativo (Horas)":
-            h_ini = _parse_hhmm(entry_hora_inicio.get())
-            if h_ini is None:
+            txt_ini = entry_hora_inicio.get().strip()
+            if not _parse_hhmm(txt_ini):
                 faltantes.append("Hora inicio (HH:MM)")
-            # Asegurar que hora fin esté calculada
-            val_fin = entry_hora_fin.get().strip()
-            if not val_fin:
+            if not entry_hora_fin.get().strip():
                 faltantes.append("Hora término (auto)")
         return faltantes
 
@@ -614,8 +838,7 @@ def construir_solicitudes(frame_padre, on_volver=None):
         h = _get_date_from_widget(entry_hasta)
         obs = entry_obs.get().strip()
 
-        # Si es por horas, anexar detalles a la observación y asegurar cálculo fin
-        detalle_horas = ""
+        # Si es por horas, anexo detalle
         if tipo == "Día Administrativo (Horas)":
             try:
                 cant = int(cmb_cantidad_horas.get())
@@ -625,28 +848,43 @@ def construir_solicitudes(frame_padre, on_volver=None):
             _calc_hora_fin()
             hora_fin_txt = entry_hora_fin.get().strip()
             detalle_horas = f" [Horas: {cant}, Inicio: {hora_ini_txt}, Término: {hora_fin_txt}]"
-            if obs:
-                obs = obs + detalle_horas
-            else:
-                obs = detalle_horas.strip()
+            obs = (obs + " " + detalle_horas).strip() if obs else detalle_horas.strip()
 
+        # Folio
         try:
             folio = get_next_folio()
         except Exception as e:
             messagebox.showerror("Folio", f"No fue posible generar el folio correlativo:\n{e}")
             return
 
-        # Guardar (pdf_path = 'MANUAL')
+        # Generar PDF (si se puede)
+        pdf_path = None
         try:
-            guardar_solicitud_en_bd(folio, rut_sel, nombre_sel, tipo, d.strftime("%Y-%m-%d"), h.strftime("%Y-%m-%d"), obs, "MANUAL")
+            pdf_path = _build_pdf_solicitud(
+                folio=folio, rut=rut_sel, nombre=nombre_sel, cargo=cargo,
+                tipo=tipo, desde=d, hasta=h, observacion=obs
+            )
+        except Exception:
+            traceback.print_exc()
+            pdf_path = None
+
+        # Guardar en BD (usa la ruta real o 'MANUAL' si no hubo PDF)
+        try:
+            guardar_solicitud_en_bd(
+                folio, rut_sel, nombre_sel, tipo,
+                d.strftime("%Y-%m-%d"), h.strftime("%Y-%m-%d"),
+                obs, pdf_path or "MANUAL"
+            )
         except Exception as e:
             messagebox.showerror("Base de Datos", f"No se pudo guardar la solicitud:\n{e}")
             return
 
+        # Preparar correo
         aviso = ("IMPORTANTE: Esta solicitud NO es oficial. Solo reserva la ausencia y "
-                 "queda sujeta a autorización. Debe formalizarse en el área administrativa "
-                 "completando el documento físico.")
-        cuerpo = (
+                 "queda sujeta a autorización. El trámite formal debe realizarse "
+                 "en el área administrativa completando el documento físico.")
+        asunto = f"Reserva de Solicitud - Folio {folio:06d} - {nombre_sel}"
+        cuerpo_txt = (
             f"{aviso}\n\n"
             f"Folio: {folio:06d}\n"
             f"Nombre: {nombre_sel}\n"
@@ -657,10 +895,39 @@ def construir_solicitudes(frame_padre, on_volver=None):
             f"Observación: {obs or '-'}\n"
             f"Generado por BioAccess."
         )
+        cuerpo_html = _html_email_solicitud(
+            folio=folio,
+            nombre=nombre_sel,
+            rut=rut_sel,
+            cargo=cargo or "-",
+            tipo=tipo,
+            desde=d.strftime('%d-%m-%Y'),
+            hasta=h.strftime('%d-%m-%Y'),
+            obs=obs or "-"
+        )
+
+        # Destinatarios: fijos + CC al funcionario si existe correo
+        to_list = list(DESTINATARIOS)
+        cc_list = []
+        correo_func = obtener_correo_por_rut(rut_sel)
+        if correo_func and "@" in correo_func:
+            cc_list.append(correo_func)
+
         try:
-            enviar_correo(DESTINATARIOS, asunto=f"Reserva de Solicitud - Folio {folio:06d} - {nombre_sel}", cuerpo=cuerpo)
-            messagebox.showinfo("Listo", f"Reserva registrada (Folio {folio:06d}).\nSe envió el aviso por correo.")
+            _smtp_send(
+                to_list=to_list,
+                cc_list=cc_list,
+                subject=asunto,
+                body_text=cuerpo_txt,
+                html_body=cuerpo_html,
+                attachment_path=pdf_path
+            )
+            msg_ok = f"Reserva registrada (Folio {folio:06d}).\nSe envió el aviso por correo."
+            if pdf_path is None:
+                msg_ok += "\n(Nota: No se pudo adjuntar PDF; ver consola para detalle)."
+            messagebox.showinfo("Listo", msg_ok)
         except Exception as e:
+            traceback.print_exc()
             messagebox.showerror("Envío", f"No se pudo enviar el correo:\n{e}")
 
     btn_enviar.configure(command=do_enviar)

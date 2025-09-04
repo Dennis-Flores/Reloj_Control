@@ -3,6 +3,7 @@ import os
 import sqlite3
 import threading
 import pickle
+import time
 from datetime import datetime
 
 import customtkinter as ctk
@@ -148,7 +149,11 @@ def cargar_nombres_ruts():
 
 
 # =========================== UI: CONSTRUIR EDICIÓN ==========================
-def construir_edicion(frame_padre, on_actualizacion=None):
+def construir_edicion(frame_padre, on_actualizacion=None, on_volver_inicio=None):
+    """
+    on_actualizacion: callback para refrescar listados o navegar (respaldo).
+    on_volver_inicio: callback que debe llevar a la pantalla de Inicio/Salida.
+    """
     # --------- limpiar contenedor ---------
     for w in frame_padre.winfo_children():
         w.destroy()
@@ -376,8 +381,31 @@ def construir_edicion(frame_padre, on_actualizacion=None):
         if on_actualizacion:
             on_actualizacion()
 
+    def cancelar():
+        
+        if callable(on_volver_inicio):
+            # Igual que solicitudes.py: no limpies primero; deja que el callback pinte todo.
+            try:
+                on_volver_inicio()
+            except TypeError:
+                # Por si tu callback espera el frame contenedor:
+                on_volver_inicio(frame_padre)
+            return
+
+        # Respaldo (si no pasaron callback): limpiar y mostrar aviso
+        for w in frame_padre.winfo_children():
+            w.destroy()
+        ctk.CTkLabel(
+            frame_padre,
+            text="Pantalla de Inicio/Salida no configurada.\nPasa on_volver_inicio a construir_edicion(...).",
+            font=("Arial", 14)
+        ).pack(pady=24)
+
+
+    # Botones inferiores
     ctk.CTkButton(contenedor_botones, text="Guardar Cambios", command=guardar_cambios).pack(side="left", padx=10)
     ctk.CTkButton(contenedor_botones, text="Eliminar Usuario", command=eliminar_usuario, fg_color="red").pack(side="left", padx=10)
+    ctk.CTkButton(contenedor_botones, text="Cancelar", command=cancelar, fg_color="#444444").pack(side="left", padx=10)
 
     # =================== Botones biometría ===================
     def ver_foto_registrada():
@@ -451,7 +479,6 @@ def construir_edicion(frame_padre, on_actualizacion=None):
         dedup_thr = DEDUP_DISTANCE_BASE
 
         # Control de fluidez
-        import time
         t_start = time.time()
         t_last_capture = t_start
         stable_ok = 0  # frames consecutivos con calidad OK
@@ -592,9 +619,210 @@ def construir_edicion(frame_padre, on_actualizacion=None):
         else:
             label_verificacion.configure(text="❌ No se guardaron muestras", text_color="red")
 
+    # --------- MODO SIMPLE (mejorado) ---------
+    def registrar_rostro_simple():
+        """
+        Captura rápida: menos muestras y criterios algo más exigentes que antes para evitar duplicados.
+        Requiere variación física (posición/tamaño) y refuerza nitidez/estabilidad.
+        """
+        rut_actual = entry_rut.get().strip()
+        if not rut_actual:
+            label_verificacion.configure(text="⚠️ Ingresa/carga primero el RUT", text_color="orange")
+            return
+
+        # --- Ajustes "simple" (un poco más exigentes) ---
+        TARGET_SAMPLES = 4
+        MIN_FACE_SIZE_S = int(MIN_FACE_SIZE * 0.88)      # rostro algo más grande
+        MIN_LAPLACIAN_S = MIN_LAPLACIAN * 0.85           # + nitidez
+        BRIGHT_MIN_S, BRIGHT_MAX_S = BRIGHT_MIN - 10, BRIGHT_MAX + 10
+        STABLE_FRAMES_NEEDED_S = 4                        # más estabilidad
+        RELAX_AFTER_SEC_S = max(6, RELAX_AFTER_SEC - 5)
+        DEDUP_DISTANCE_BASE_S = max(0.34, DEDUP_DISTANCE_BASE)   # más estricto
+        RELAX_FACTORS_S = {
+            "laplacian": 0.80,                           # relax menos agresivo
+            "face_size": 0.90,
+            "bright_pad": RELAX_FACTORS["bright_pad"] + 6,
+            "dedup_delta": 0.00,                         # NO aflojar dedup
+        }
+
+        # Reglas extra: variación física entre capturas
+        MIN_TIME_BETWEEN_CAPTURES = 0.8   # seg
+        MIN_CENTER_DELTA_PX = 28          # desplazamiento mínimo de centro
+        MIN_SCALE_DELTA = 0.12            # cambio mínimo de tamaño (~12%)
+        last_ok_loc = None
+
+        cap = cv2.VideoCapture(0)
+        if not cap.isOpened():
+            label_verificacion.configure(text="❌ No se pudo abrir la cámara", text_color="red")
+            return
+
+        label_verificacion.configure(
+            text=("🎥 Modo SIMPLE: 3–4 muestras, mueve levemente IZQ/DER o acércate/aleja.\n"
+                  "Auto-captura activada cuando se vea bien."),
+            text_color="white"
+        )
+
+        samples = []
+        last_frame_ok = None
+
+        t_start = time.time()
+        t_last_capture = t_start
+        stable_ok = 0
+
+        cv2.namedWindow("Captura de rostro (Simple)", cv2.WINDOW_NORMAL)
+        cv2.resizeWindow("Captura de rostro (Simple)", 900, 680)
+
+        while True:
+            ok_ret, frame = cap.read()
+            if not ok_ret:
+                continue
+
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            locs = face_recognition.face_locations(rgb, model="hog")
+
+            elapsed_since_last = time.time() - t_last_capture
+            relax = elapsed_since_last >= RELAX_AFTER_SEC_S
+
+            # Parámetros “live” con relajación rápida
+            min_face  = int(MIN_FACE_SIZE_S * (RELAX_FACTORS_S["face_size"] if relax else 1.0))
+            min_lap   = float(MIN_LAPLACIAN_S * (RELAX_FACTORS_S["laplacian"] if relax else 1.0))
+            bright_lo = BRIGHT_MIN_S - (RELAX_FACTORS_S["bright_pad"] if relax else 0)
+            bright_hi = BRIGHT_MAX_S + (RELAX_FACTORS_S["bright_pad"] if relax else 0)
+            dedup_thr = DEDUP_DISTANCE_BASE_S + (RELAX_FACTORS_S["dedup_delta"] if relax else 0.0)
+
+            # HUD progreso
+            done, total = len(samples), TARGET_SAMPLES
+            bar_w = 340
+            progress = int((done / total) * bar_w)
+            cv2.rectangle(frame, (20, 20), (20 + bar_w, 40), (40, 40, 40), -1)
+            cv2.rectangle(frame, (20, 20), (20 + progress, 40), (0, 200, 0), -1)
+            cv2.rectangle(frame, (20, 20), (20 + bar_w, 40), (255, 255, 255), 1)
+            cv2.putText(frame, f"{done}/{total}", (24 + bar_w + 8, 38),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+
+            cv2.putText(frame, "Modo SIMPLE: 3–4 muestras (mueve levemente: izquierda/derecha/zoom)",
+                        (20, 72), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+            guide_msg = "ESPACIO/ENTER = Capturar   |   ESC = Cancelar"
+            cv2.putText(frame, guide_msg, (20, 136), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,200), 2)
+
+            key = cv2.waitKey(1) & 0xFF
+            can_capture_now = False
+            loc_ok = None
+
+            if len(locs) == 0:
+                stable_ok = 0
+                cv2.putText(frame, "Ubica el rostro dentro del cuadro", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+            elif len(locs) > MAX_FACES_FRAME:
+                stable_ok = 0
+                cv2.putText(frame, "Solo 1 rostro en cuadro", (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,0,255), 2)
+            else:
+                loc = locs[0]
+                ok_q, motivo = _quality_ok(frame, loc,
+                                           min_face_size=min_face,
+                                           min_lap=min_lap,
+                                           bright_min=bright_lo,
+                                           bright_max=bright_hi)
+                top, right, bottom, left = loc
+                cv2.rectangle(frame, (left, top), (right, bottom),
+                              (0, 255, 0) if ok_q else (0, 255, 255), 2)
+
+                if ok_q:
+                    stable_ok += 1
+                    can_capture_now = True
+                    loc_ok = loc
+                    cv2.putText(frame, f"Estable: {stable_ok}/{STABLE_FRAMES_NEEDED_S}", (20, 104),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (124,255,124), 2)
+                    if AUTO_CAPTURE_ENABLED and stable_ok >= STABLE_FRAMES_NEEDED_S:
+                        key = 32  # auto-disparo
+                else:
+                    stable_ok = 0
+                    cv2.putText(frame, motivo, (20, 104), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,255), 2)
+
+            cv2.imshow("Captura de rostro (Simple)", frame)
+
+            if key == 27:  # ESC
+                label_verificacion.configure(text="❌ Captura cancelada (simple)", text_color="orange")
+                break
+
+            elif key in (32, ord(' '), 13):  # SPACE/ENTER (o auto-disparo)
+                if not can_capture_now or loc_ok is None:
+                    continue
+
+                encs = face_recognition.face_encodings(rgb, known_face_locations=[loc_ok])
+                if not encs:
+                    stable_ok = 0
+                    continue
+
+                enc_new = encs[0]
+                # Anti-duplicados por encoding (más estricto)
+                if samples:
+                    d = face_recognition.face_distance(np.vstack(samples), enc_new).min()
+                    if d < dedup_thr:
+                        cv2.putText(frame, f"Muy similar (d={d:.2f}). Cambia expresion/angulo/iluminacion.",
+                                    (20, 168), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        cv2.imshow("Captura de rostro (Simple)", frame); cv2.waitKey(280)
+                        stable_ok = max(0, STABLE_FRAMES_NEEDED_S - 2)
+                        continue
+
+                # Verificación de variación física vs última aceptada
+                top, right, bottom, left = loc_ok
+                cx = (left + right) // 2
+                cy = (top + bottom) // 2
+                size = min(right - left, bottom - top)
+
+                if last_ok_loc is not None:
+                    ltop, lright, lbottom, lleft = last_ok_loc
+                    lcx = (lleft + lright) // 2
+                    lcy = (ltop + lbottom) // 2
+                    lsize = min(lright - lleft, lbottom - ltop)
+
+                    center_delta = ((cx - lcx)**2 + (cy - lcy)**2) ** 0.5
+                    scale_delta = abs(size - lsize) / max(1, lsize)
+                    recent = (time.time() - t_last_capture) < MIN_TIME_BETWEEN_CAPTURES
+
+                    if recent or (center_delta < MIN_CENTER_DELTA_PX and scale_delta < MIN_SCALE_DELTA):
+                        cv2.putText(frame, "Cambia levemente posicion/zoom/angulo", (20, 232),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
+                        cv2.imshow("Captura de rostro (Simple)", frame); cv2.waitKey(300)
+                        stable_ok = max(0, STABLE_FRAMES_NEEDED_S - 2)
+                        continue
+
+                # Aceptar muestra
+                samples.append(enc_new)
+                last_frame_ok = frame.copy()
+                t_last_capture = time.time()
+                stable_ok = 0
+                last_ok_loc = loc_ok
+
+                cv2.putText(frame, "¡Muestra guardada!", (20, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+                cv2.imshow("Captura de rostro (Simple)", frame); cv2.waitKey(220)
+
+                if len(samples) >= TARGET_SAMPLES:
+                    break
+
+        cap.release()
+        cv2.destroyAllWindows()
+
+        if samples:
+            ref_frame = last_frame_ok if last_frame_ok is not None else np.zeros((200, 200, 3), dtype=np.uint8)
+            _guardar_biometria(rut_actual, ref_frame, samples)
+            label_verificacion.configure(
+                text=f"✅ Rostro actualizado (simple) ({len(samples)}/{TARGET_SAMPLES})",
+                text_color="green"
+            )
+            try:
+                with open("log_capturas.txt", "a", encoding="utf-8") as log:
+                    log.write(f"{datetime.now().strftime('%d/%m/%Y %H:%M:%S')} - Captura SIMPLE (edición) {rut_actual} ({len(samples)} muestras)\n")
+            except Exception:
+                pass
+        else:
+            label_verificacion.configure(text="❌ No se guardaron muestras (simple)", text_color="red")
+
     # Botones biometría
     ctk.CTkButton(panel_datos, text="📸 Volver a registrar rostro", font=("Arial", 14, "bold"),
                   command=registrar_rostro).pack(pady=10)
+    ctk.CTkButton(panel_datos, text="⚡ Volver a Registrar Rostro Simple",
+                  command=registrar_rostro_simple).pack(pady=(0, 10))
     ctk.CTkButton(panel_datos, text="👁️ Ver foto registrada",
                   command=ver_foto_registrada).pack(pady=(0, 10))
 

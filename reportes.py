@@ -6,26 +6,47 @@ import tkinter as tk
 import pandas as pd
 import os
 from tkinter import messagebox
-import time
 import math
+from collections import Counter
+import smtplib
+import ssl
+import mimetypes
+from email.message import EmailMessage
 
 from feriados import es_feriado  # tu módulo de feriados
 
+# ======== PDF ========
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, KeepTogether
+    from reportlab.lib.units import mm
+    from reportlab.lib.enums import TA_LEFT
+    HAS_PDF = True
+except Exception:
+    HAS_PDF = False
 
 # ========= Configuración de ajuste especial (43h/44h) =========
-# Aplica +2h30m (150 min) SOLO si:
-#   - La suma estricta de bloques es 40:30 (2430) -> 43:00
-#   - O la suma es 41:30 (2490) -> 44:00
-#   - Y hay >= 4 días con 2 o más bloques (indicio de colación fuera de los bloques)
 AJUSTE_COLACION_FIJO_43_44 = True
 MINUTOS_AJUSTE_FIJO = 150
-TOLERANCIA_MIN = 5  # tolerancia para empates (por si hay HH:MM ligeramente distintos)
+TOLERANCIA_MIN = 5  # tolerancia
 
+# ========= Fallback SMTP (igual a tu ejemplo de asistencia_diaria) =========
+SMTP_FALLBACK = {
+    "host": "mail.bioaccess.cl",
+    "port": 465,  # SSL directo
+    "user": "documentos_bd@bioaccess.cl",
+    "password": "documentos@2025",
+    "use_tls": False,
+    "use_ssl": True,
+    "remitente": "documentos_bd@bioaccess.cl",
+}
 
 # ===================== Helpers de hora =====================
 
 def parse_hora_flexible(hora_str):
-    """Devuelve un datetime (solo tiempo relevante) para HH:MM o HH:MM:SS."""
+    """Devuelve un datetime (solo tiempo) para HH:MM o HH:MM:SS."""
     if not hora_str:
         return None
     for fmt in ("%H:%M:%S", "%H:%M"):
@@ -35,6 +56,15 @@ def parse_hora_flexible(hora_str):
             continue
     return None
 
+def _ph_any(s):
+    if not s:
+        return None
+    for f in ("%H:%M:%S", "%H:%M"):
+        try:
+            return datetime.strptime(s.strip(), f)
+        except Exception:
+            pass
+    return None
 
 def obtener_horario_del_dia(rut, fecha_dt):
     """Devuelve (hora_entrada, hora_salida) pactadas para ese día (strings HH:MM[:SS])."""
@@ -64,29 +94,44 @@ def obtener_horario_del_dia(rut, fecha_dt):
     hs = filas[-1][1].strip() if filas[-1][1] else None
     return (he, hs)
 
-
 # ===================== Datos del trabajador =====================
 
 def get_info_trabajador(conn, rut):
-    """Devuelve (nombre, apellido, profesion) para el RUT."""
+    """Devuelve (nombre, apellido, profesion, correo?) para el RUT."""
     cur = conn.cursor()
-    cur.execute("""
-        SELECT nombre, apellido, profesion
-        FROM trabajadores
-        WHERE rut = ?
-    """, (rut,))
+    # intentar traer correo si existe la columna
+    try:
+        cur.execute("PRAGMA table_info(trabajadores)")
+        cols = {c[1].lower() for c in cur.fetchall()}
+    except Exception:
+        cols = set()
+    if "correo" in cols:
+        cur.execute("""
+            SELECT nombre, apellido, profesion, correo
+            FROM trabajadores
+            WHERE rut = ?
+        """, (rut,))
+    else:
+        cur.execute("""
+            SELECT nombre, apellido, profesion
+            FROM trabajadores
+            WHERE rut = ?
+        """, (rut,))
     row = cur.fetchone()
-    return row if row else None
-
+    if not row:
+        return None
+    if "correo" in cols:
+        return row  # (nombre, apellido, profesion, correo)
+    return (row[0], row[1], row[2], None)
 
 # ===================== Carga Horaria (semanal) =====================
 
 def calcular_carga_horaria_semana(rut):
     """
-    Suma total de minutos de la semana según 'horarios':
-      - Suma estricta (salida - entrada) de todos los bloques configurados.
-      - Si coincide con patrones típicos de 43h/44h (colación fuera de los bloques),
-        agrega +150 min SOLO en esos casos.
+    Suma total de minutos de la semana según 'horarios' (salida - entrada).
+    Ajuste 43h/44h (+150min) si:
+      - total == 40:30 (2430) o 41:30 (2490), y
+      - hay >= 4 días con 2+ bloques (colación fuera).
     """
     con = sqlite3.connect("reloj_control.db")
     cur = con.cursor()
@@ -100,8 +145,7 @@ def calcular_carga_horaria_semana(rut):
     filas = cur.fetchall()
     con.close()
 
-    # Agrupar por día para contar bloques/día
-    bloques_por_dia = {}  # d -> [(he, hs), ...]
+    bloques_por_dia = {}
     for d, he, hs in filas:
         bloques_por_dia.setdefault(d, []).append((he, hs))
 
@@ -109,7 +153,6 @@ def calcular_carga_horaria_semana(rut):
     dias_con_2o_mas_bloques = 0
 
     for d, bloques in bloques_por_dia.items():
-        # contar bloques válidos del día y sumar minutos del día
         bloques_validos = 0
         for he, hs in bloques:
             t1 = parse_hora_flexible(he)
@@ -122,32 +165,193 @@ def calcular_carga_horaria_semana(rut):
         if bloques_validos >= 2:
             dias_con_2o_mas_bloques += 1
 
-    # Ajuste especial 43/44 horas (solo si tiene varios días partidos)
     if AJUSTE_COLACION_FIJO_43_44 and dias_con_2o_mas_bloques >= 4:
-        # 40:30 (2430) -> 43:00 ; 41:30 (2490) -> 44:00
         if abs(total_min - 2430) <= TOLERANCIA_MIN or abs(total_min - 2490) <= TOLERANCIA_MIN:
             total_min += MINUTOS_AJUSTE_FIJO
 
     return total_min
 
+# ===================== Utilidades BD / SMTP =====================
 
-# ===================== UI principal de reportes =====================
+def obtener_cupo_admin_para_rut(rut):
+    """
+    Lee cupo anual de días administrativos desde:
+    tabla: parametros_trabajador(rut TEXT, clave TEXT, valor TEXT)
+    clave = 'dias_admin_cupo'
+    """
+    try:
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        cur.execute("""
+            SELECT valor FROM parametros_trabajador
+            WHERE rut=? AND clave='dias_admin_cupo'
+        """, (rut,))
+        row = cur.fetchone()
+        con.close()
+        if row and row[0]:
+            return int(row[0])
+    except Exception:
+        pass
+    return None
+
+def _smtp_load_config():
+    """
+    Carga configuración SMTP desde BD.
+    Busca tabla 'smtp_config' (host, port, user, password, use_tls, use_ssl, remitente)
+    o 'parametros_smtp' con pares clave/valor.
+    Retorna dict o None si no hay configuración.
+    """
+    cfg = {}
+    try:
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        # Opción 1: smtp_config
+        try:
+            cur.execute("SELECT host, port, user, password, use_tls, use_ssl, remitente FROM smtp_config LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                cfg = {
+                    "host": row[0],
+                    "port": int(row[1]) if row[1] is not None else 0,
+                    "user": row[2],
+                    "password": row[3],
+                    "use_tls": str(row[4]).lower() in ("1", "true", "t", "yes", "y"),
+                    "use_ssl": str(row[5]).lower() in ("1", "true", "t", "yes", "y"),
+                    "remitente": row[6] or row[2]
+                }
+                con.close()
+                return cfg
+        except Exception:
+            pass
+
+        # Opción 2: parametros_smtp (clave/valor)
+        try:
+            cur.execute("SELECT clave, valor FROM parametros_smtp")
+            rows = cur.fetchall()
+            if rows:
+                mapa = {k: v for k, v in rows}
+                cfg = {
+                    "host": mapa.get("host"),
+                    "port": int(mapa.get("port", "0")),
+                    "user": mapa.get("user"),
+                    "password": mapa.get("password"),
+                    "use_tls": str(mapa.get("use_tls", "true")).lower() in ("1", "true", "t", "yes", "y"),
+                    "use_ssl": str(mapa.get("use_ssl", "false")).lower() in ("1", "true", "t", "yes", "y"),
+                    "remitente": mapa.get("remitente", mapa.get("user"))
+                }
+                con.close()
+                return cfg
+        except Exception:
+            pass
+
+        con.close()
+    except Exception:
+        pass
+    return None
+
+def _smtp_send(to_list, cc_list, subject, body_text, html_body, attachment_path=None):
+    """
+    Envía correo. Intenta con configuración en BD; si no hay, usa fallback BioAccess.
+    """
+    cfg = _smtp_load_config() or SMTP_FALLBACK
+
+    msg = EmailMessage()
+    remitente = cfg.get("remitente") or cfg.get("user")
+    msg["From"] = remitente
+    msg["To"] = ", ".join(to_list) if to_list else ""
+    if cc_list:
+        msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = subject or "Reporte de Asistencia"
+    msg.set_content(body_text or "")
+
+    if html_body:
+        msg.add_alternative(html_body, subtype="html")
+
+    if attachment_path and os.path.exists(attachment_path):
+        try:
+            with open(attachment_path, "rb") as f:
+                data = f.read()
+            mime, _ = mimetypes.guess_type(attachment_path)
+            if mime:
+                maintype, subtype = mime.split("/", 1)
+            else:
+                maintype, subtype = "application", "octet-stream"
+            msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=os.path.basename(attachment_path))
+        except Exception as e:
+            raise RuntimeError(f"No se pudo adjuntar el archivo: {e}")
+
+    host = cfg["host"]
+    port = cfg.get("port") or (465 if cfg.get("use_ssl") else 587)
+    user = cfg.get("user")
+    password = cfg.get("password")
+    use_ssl = cfg.get("use_ssl")
+    use_tls = cfg.get("use_tls")
+
+    if use_ssl:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=30) as server:
+            if user and password:
+                server.login(user, password)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=30) as server:
+            server.ehlo()
+            if use_tls:
+                context = ssl.create_default_context()
+                server.starttls(context=context)
+                server.ehlo()
+            if user and password:
+                server.login(user, password)
+            server.send_message(msg)
+
+# ===================== Email (HTML simple) =====================
+
+def _html_email_informe(periodo: str, identidad: str):
+    gen = datetime.now().strftime("%d-%m-%Y %H:%M")
+    PAGE_BG = "#f3f4f6"
+    CARD_BG = "#ffffff"
+    TEXT    = "#111827"
+    MUTED   = "#6b7280"
+    BORDER  = "#e5e7eb"
+    ACCENT  = "#0b5ea8"
+    return f"""<!doctype html>
+<html lang="es"><meta charset="utf-8">
+<body style="margin:0;padding:24px;background:{PAGE_BG};color:{TEXT};font-family:Arial,Helvetica,sans-serif">
+  <div style="max-width:720px;margin:0 auto;background:{CARD_BG};border:1px solid {BORDER};border-radius:12px;padding:20px;box-sizing:border-box">
+    <h1 style="margin:0 0 10px 0;font-size:20px;color:{TEXT}">Reporte de Asistencia</h1>
+    <p style="margin:8px 0 14px 0;line-height:1.55;color:{TEXT}">
+      Estimado(a), se adjunta el <strong>reporte de asistencia</strong> correspondiente al período indicado.
+      Documento generado por <strong>BioAccess – Control de Horarios</strong>.
+    </p>
+    <div style="margin:0 0 12px 0;line-height:1.7">
+      <span style="display:inline-block;background:{ACCENT};color:#ffffff;border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px">Periodo: {periodo}</span>
+      <span style="display:inline-block;background:#eaf2fb;border:1px solid #bfd6f7;color:{ACCENT};border-radius:8px;padding:4px 10px;font-size:12px">Funcionario: {identidad}</span>
+    </div>
+    <p style="margin:14px 0 0 0;color:{MUTED};font-size:12px">Generado el {gen}.</p>
+  </div>
+</body>
+</html>"""
+
+# ===================== Construir Reportes (UI + lógica) =====================
 
 def construir_reportes(frame_padre):
     registros_por_dia = {}
-    modo_exportable = False
-
     label_estado = None
     label_datos = None
     label_total = None
-    label_leyenda_admin = None
     label_total_semana = None
     label_pactadas = None
     label_completadas = None
+    label_resumen = None
 
+    # -------- calendario --------
     def seleccionar_fecha(entry_target):
         top = tk.Toplevel()
-        top.grab_set()
+        try:
+            top.transient(frame.winfo_toplevel())
+            top.grab_set()
+        except Exception:
+            pass
         cal = Calendar(top, date_pattern='dd/mm/yyyy', locale='es_CL')
         cal.pack(padx=10, pady=10)
 
@@ -159,6 +363,7 @@ def construir_reportes(frame_padre):
 
         ctk.CTkButton(top, text="Seleccionar", command=poner_fecha).pack(pady=5)
 
+    # -------- horas pactadas por día administrativo --------
     def obtener_horas_administrativo(rut, fecha_str_o_dt, como_minutos=False):
         """Suma de (salida-entrada) en horarios pactados del día de la semana; normaliza tildes."""
         try:
@@ -195,8 +400,7 @@ def construir_reportes(frame_padre):
                 salida = parse_hora_flexible(salida_str)
                 if not entrada or not salida:
                     continue
-                duracion = salida - entrada
-                minutos = int(duracion.total_seconds() // 60)
+                minutos = int((salida - entrada).total_seconds() // 60)
                 total_minutos += int(minutos)
 
             if como_minutos:
@@ -209,11 +413,11 @@ def construir_reportes(frame_padre):
             print("Error al calcular horas administrativas:", e)
             return 0 if como_minutos else "00:00"
 
+    # -------- mezcla administrativos --------
     def agregar_dias_administrativos(regs_por_dia, rut, desde_dt, hasta_dt):
         """Mezcla en regs_por_dia los registros de dias_libres con motivo; calcula trabajado según horario."""
         conexion = sqlite3.connect("reloj_control.db")
         cursor = conexion.cursor()
-
         desde_str = desde_dt.strftime('%Y-%m-%d')
         hasta_str = hasta_dt.strftime('%Y-%m-%d')
 
@@ -246,46 +450,38 @@ def construir_reportes(frame_padre):
                 print(f"Error al procesar día administrativo {fecha}: {str(e)}")
                 continue
 
-    def exportar_excel():
-        nonlocal label_estado
-
-        def parse_hora(hora_str):
-            for fmt in ("%H:%M:%S", "%H:%M"):
-                try:
-                    return datetime.strptime(hora_str.strip(), fmt)
-                except ValueError:
-                    continue
-            raise ValueError(f"Formato de hora inválido: {hora_str}")
-
-        rut = entry_rut.get().strip()
-        if not modo_exportable:
-            label_estado.configure(text="⚠️ Ingresa un rango de fechas para exportar", text_color="orange")
-            return
-
-        datos = []
-        total_minutos = 0
+    # -------- estadísticas y resumen del período --------
+    def calcular_estadisticas_periodo(rut, registros_dict, desde_dt, hasta_dt):
+        """
+        Retorna dict con:
+          total_min_trabajados, total_min_atraso, dias_admin_usados, dias_admin_pendientes (o None),
+          feriados, dias_ok, dias_incompletos, obs_counter (Counter)
+        """
+        total_min_trabajados = 0
+        total_min_atraso = 0
         dias_ok = 0
         dias_incompletos = 0
-        dias_administrativos = 0
-        permisos_extra = 0
-        minutos_atraso_real = 0
+        feriados = 0
+        obs_counter = Counter()
+        admin_usados = 0
 
-        for fecha in sorted(registros_por_dia):
-            minutos_atraso_dia_para_excel = 0
-            ingreso = registros_por_dia[fecha].get("ingreso", "--")
-            salida = registros_por_dia[fecha].get("salida", "--")
-            obs_ingreso = registros_por_dia[fecha].get("obs_ingreso", "")
-            obs_salida = registros_por_dia[fecha].get("obs_salida", "")
-            es_admin = registros_por_dia[fecha].get("es_admin", False)
-            es_fer = registros_por_dia[fecha].get("es_feriado", False)
-            obs_texto = obs_ingreso or obs_salida
-            motivo = (obs_ingreso or "").strip().lower()
+        for fecha in sorted(registros_dict):
+            info = registros_dict[fecha]
+            ingreso = info.get("ingreso") or "--"
+            salida = info.get("salida") or "--"
+            es_admin = info.get("es_admin", False)
+            es_fer = info.get("es_feriado", False)
+            obs_ingreso = info.get("obs_ingreso", "") or ""
+            obs_salida = info.get("obs_salida", "") or ""
+            obs_txt = (obs_ingreso + " " + obs_salida).strip()
+            if obs_txt:
+                obs_counter[obs_txt] += 1
 
-            trabajado_dia = "--:--"
-            estado_dia = "⚠️ Incompleto"
+            if es_fer:
+                feriados += 1
 
-            # ATRASO (solo si hay ingreso)
-            if ingreso not in (None, "--"):
+            # atraso (tolerancia 5m)
+            if ingreso != "--":
                 try:
                     fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
                     nombre_dia = fecha_dt.strftime("%A")
@@ -302,106 +498,486 @@ def construir_reportes(frame_padre):
                     """, (rut, nombre_dia_es))
                     resultado = cursor.fetchone()
                     conexion.close()
-
                     if resultado:
                         hora_esperada_entrada = resultado[0]
-                        fecha_base = fecha_dt.date()
-
-                        def _ph(s):
-                            for f in ("%H:%M:%S", "%H:%M"):
-                                try: return datetime.strptime(s.strip(), f)
-                                except: pass
-                            return None
-
-                        hora_ingreso_parsed = _ph(ingreso)
-                        hora_esperada_parsed = _ph(hora_esperada_entrada)
-                        if hora_ingreso_parsed and hora_esperada_parsed:
-                            t_ingreso = datetime.combine(fecha_base, hora_ingreso_parsed.time())
-                            t_esperado_ingreso = datetime.combine(fecha_base, hora_esperada_parsed.time())
-                            delta_ingreso = (t_ingreso - t_esperado_ingreso).total_seconds()
-                            ingreso_valido = delta_ingreso <= 300  # 5 min de tolerancia
-                            if not ingreso_valido:
-                                segundos_excedentes = delta_ingreso - 300
-                                minutos_atraso_dia_para_excel = max(0, math.ceil(segundos_excedentes / 60))
-                                minutos_atraso_real = minutos_atraso_real + minutos_atraso_dia_para_excel
+                        t_ingreso = _ph_any(ingreso)
+                        t_esperada = _ph_any(hora_esperada_entrada)
+                        if t_ingreso and t_esperada:
+                            base_date = fecha_dt.date()
+                            t_i = datetime.combine(base_date, t_ingreso.time())
+                            t_e = datetime.combine(base_date, t_esperada.time())
+                            delta = (t_i - t_e).total_seconds()
+                            if delta > 300:
+                                total_min_atraso += math.ceil((delta - 300) / 60.0)
                 except Exception:
                     pass
 
-            # HORAS TRABAJADAS (solo si hay ingreso y salida)
-            if ingreso not in (None, "--") and salida not in (None, "--"):
-                t1 = parse_hora_flexible(ingreso)
-                t2 = parse_hora_flexible(salida)
-                if t1 and t2:
-                    duracion = (t2 - t1)
-                    minutos = int(duracion.total_seconds() // 60)
-                    h, m = divmod(minutos, 60)
-                    trabajado_dia = f"{int(h):02}:{int(m):02}"
-                    total_minutos += int(minutos)
-                else:
-                    trabajado_dia = "--:--"
+            # trabajado
+            trabajado_str = info.get("trabajado")
+            if not trabajado_str or trabajado_str == "0h 0min":
+                if ingreso != "--" and salida != "--":
+                    t1 = parse_hora_flexible(ingreso)
+                    t2 = parse_hora_flexible(salida)
+                    if t1 and t2:
+                        mins = int((t2 - t1).total_seconds() // 60)
+                        total_min_trabajados += mins
+                        info["trabajado"] = f"{mins//60}h {mins%60}min"
+                elif es_admin:
+                    mins = obtener_horas_administrativo(rut, fecha, como_minutos=True)
+                    total_min_trabajados += int(mins)
+            else:
+                mins = 0
+                if "h" in trabajado_str:
+                    try:
+                        h_part, m_part = trabajado_str.replace("min", "").split("h")
+                        mins = int(h_part.strip()) * 60 + int(m_part.strip())
+                    except Exception:
+                        mins = 0
+                elif ":" in trabajado_str:
+                    try:
+                        h_part, m_part = trabajado_str.split(":")
+                        mins = int(h_part) * 60 + int(m_part)
+                    except Exception:
+                        mins = 0
+                total_min_trabajados += mins
 
-            # ESTADO DEL DÍA
-            if ingreso not in (None, "--") and salida not in (None, "--"):
-                if minutos_atraso_dia_para_excel == 0:
-                    estado_dia = "✅ Día Completado Satisfactoriamente"
+            # estado del día
+            if (ingreso != "--" and salida != "--"):
+                dias_ok += 1
+            else:
+                if es_admin or es_fer:
                     dias_ok += 1
                 else:
-                    estado_dia = "⚠️ Incompleto"
                     dias_incompletos += 1
-            elif ingreso or salida:
-                dias_incompletos += 1
 
-            # ADMINISTRATIVO O PERMISO
             if es_admin:
-                trabajado_dia = registros_por_dia[fecha].get("trabajado", trabajado_dia)
-                minutos_admin = obtener_horas_administrativo(rut, fecha, como_minutos=True)
-                total_minutos += int(minutos_admin)
+                admin_usados += 1
 
-                if "administrativo" in motivo:
-                    dias_administrativos += 1
-                else:
-                    permisos_extra += 1
+        cupo = obtener_cupo_admin_para_rut(rut)
+        admin_pendientes = None
+        if cupo is not None:
+            admin_pendientes = max(0, int(cupo) - int(admin_usados))
 
-                if estado_dia == "⚠️ Incompleto" and (ingreso in (None, "--") or salida in (None, "--")):
-                    estado_dia = "📌 Permiso Aceptado"
+        return {
+            "total_min_trabajados": int(total_min_trabajados),
+            "total_min_atraso": int(total_min_atraso),
+            "dias_admin_usados": int(admin_usados),
+            "dias_admin_pendientes": admin_pendientes,
+            "feriados": int(feriados),
+            "dias_ok": int(dias_ok),
+            "dias_incompletos": int(dias_incompletos),
+            "obs_counter": obs_counter
+        }
 
-            tipo_dia = "Feriado" if es_fer else ("Administrativo" if es_admin else ("Normal" if ingreso and salida else "Incompleto"))
-
-            datos.append([
-                fecha, ingreso, salida, trabajado_dia,
-                minutos_atraso_dia_para_excel,
-                obs_texto, estado_dia, tipo_dia
-            ])
-
-        h_tot, m_tot = divmod(int(total_minutos), 60)
-        total_trabajado = f"{int(h_tot):02}:{int(m_tot):02}"
-        datos.append(["", "", "", "", "", ""])
-        datos.append(["", "", "", f"Total trabajado: {total_trabajado}", "", f"✅ Días OK: {dias_ok} / ⚠️ Incompletos: {dias_incompletos}"])
-
-        columnas = ["Fecha", "Ingreso", "Salida", "Horas Trabajadas Por Día", "Minutos Atrasados del Mes", "Observación", "Estado del Día", "Tipo de Día"]
-        df = pd.DataFrame(datos, columns=columnas)
-
-        carpeta_descargas = os.path.join(os.path.expanduser("~"), "Downloads")
-        nombre_archivo = f"reporte_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-        ruta_completa = os.path.join(carpeta_descargas, nombre_archivo)
-
+    # -------- export EXCEL (respaldo si no hay reportlab) --------
+    def exportar_excel(datos_tabla, resumen, ruta_sugerida):
+        columnas = ["Fecha", "Ingreso", "Salida", "Horas Trabajadas Por Día", "Minutos Atraso Día", "Observación"]
+        df = pd.DataFrame(datos_tabla, columns=columnas)
         try:
-            df.to_excel(ruta_completa, index=False)
-            time.sleep(1)
-            label_estado.configure(
-                text=f"✅ El archivo fue exportado exitosamente.\nSe guardó en Descargas como:\n{nombre_archivo}",
-                text_color="green"
-            )
-            messagebox.showinfo("Exportación exitosa", f"El archivo fue guardado en Descargas:\n{nombre_archivo}")
+            df.to_excel(ruta_sugerida, index=False)
+            with pd.ExcelWriter(ruta_sugerida, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+                rws = []
+                tmin = resumen["total_min_trabajados"]
+                h, m = divmod(tmin, 60)
+                rws.append(["Horas trabajadas (período)", f"{h:02d}:{m:02d}"])
+                rws.append(["Minutos acumulados de atraso", resumen["total_min_atraso"]])
+                rws.append(["Días administrativos usados", resumen["dias_admin_usados"]])
+                rws.append(["Días administrativos pendientes", "—" if resumen["dias_admin_pendientes"] is None else resumen["dias_admin_pendientes"]])
+                rws.append(["Feriados del período", resumen["feriados"]])
+                rws.append(["Días completos", resumen["dias_ok"]])
+                rws.append(["Días incompletos", resumen["dias_incompletos"]])
+                rws.append([])
+                rws.append(["Observaciones (Top 10)", "Veces"])
+                for obs, cnt in resumen["obs_counter"].most_common(10):
+                    rws.append([obs, cnt])
+                pd.DataFrame(rws).to_excel(writer, index=False, header=False, sheet_name="Resumen")
+            messagebox.showinfo("Exportación exitosa", f"Excel guardado:\n{os.path.basename(ruta_sugerida)}")
             try:
-                os.startfile(ruta_completa)  # Windows
+                os.startfile(ruta_sugerida)
             except Exception:
                 pass
         except Exception as e:
-            label_estado.configure(text=f"❌ Error al exportar: {str(e)}", text_color="red")
+            messagebox.showerror("Error", f"No se pudo exportar Excel:\n{e}")
 
+    # -------- export PDF --------
+    def exportar_pdf(rut, nombre, apellido, cargo, periodo, datos_tabla, resumen, abrir=True):
+        if not HAS_PDF:
+            messagebox.showwarning(
+                "PDF no disponible",
+                "No se encontró reportlab.\nInstala con: pip install reportlab\nSe intentará exportar Excel como respaldo."
+            )
+            carpeta_descargas = os.path.join(os.path.expanduser("~"), "Downloads")
+            nombre_xlsx = f"reporte_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+            exportar_excel(datos_tabla, resumen, os.path.join(carpeta_descargas, nombre_xlsx))
+            return None
+
+        carpeta_descargas = os.path.join(os.path.expanduser("~"), "Downloads")
+        nombre_pdf = f"reporte_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
+        ruta = os.path.join(carpeta_descargas, nombre_pdf)
+
+        doc = SimpleDocTemplate(
+            ruta,
+            pagesize=landscape(A4),
+            rightMargin=14*mm, leftMargin=14*mm,
+            topMargin=12*mm, bottomMargin=12*mm
+        )
+
+        styles = getSampleStyleSheet()
+        styles.add(ParagraphStyle(name="Small", fontSize=9, leading=11))
+        styles.add(ParagraphStyle(name="Bold", parent=styles["Normal"], fontSize=10, leading=12, spaceBefore=2, spaceAfter=2))
+        styles.add(ParagraphStyle(name="Header", parent=styles["Title"], fontSize=18, leading=22, alignment=TA_LEFT))
+
+        story = []
+
+        # Título exacto
+        story.append(Paragraph("Reporte de Asistencia", styles["Header"]))
+
+        # Línea periodo/generado
+        story.append(Paragraph(
+            f"Período: {periodo} &nbsp;&nbsp;|&nbsp;&nbsp; Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+            styles["Normal"]
+        ))
+        story.append(Spacer(1, 4))
+
+        # Bloque de datos del usuario (Nombre / Cargo)
+        tabla_ident = Table(
+            [
+                ["Nombre:", f"{nombre} {apellido}"],
+                ["Cargo:", cargo or ""],
+            ],
+            colWidths=[25*mm, 120*mm]
+        )
+        tabla_ident.setStyle(TableStyle([
+            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+            ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f0f4f8")),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+            ("FONTSIZE", (0,0), (-1,-1), 10),
+            ("LEFTPADDING", (0,0), (-1,-1), 6),
+            ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ]))
+        story.append(KeepTogether([tabla_ident]))
+        story.append(Spacer(1, 8))
+
+        # Resumen (bloque)
+        tmin = resumen["total_min_trabajados"]
+        h, m = divmod(tmin, 60)
+        filas_resumen = [
+            ["Horas trabajadas en el período", f"{h:02d}:{m:02d}"],
+            ["Minutos acumulados de atraso", f"{resumen['total_min_atraso']} min"],
+            ["Días administrativos usados", resumen["dias_admin_usados"]],
+            ["Días administrativos pendientes", "—" if resumen["dias_admin_pendientes"] is None else resumen["dias_admin_pendientes"]],
+            ["Feriados en el período", resumen["feriados"]],
+            ["Días con registro completo", resumen["dias_ok"]],
+            ["Días incompletos", resumen["dias_incompletos"]],
+        ]
+        tabla_resumen = Table(filas_resumen, colWidths=[120*mm, 40*mm])
+        tabla_resumen.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (1,0), colors.HexColor("#f0f4f8")),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("ALIGN", (1,0), (1,-1), "RIGHT"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("FONTSIZE", (0,0), (-1,-1), 10),
+            ("LEFTPADDING", (0,0), (-1,-1), 6),
+            ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ]))
+        story.append(KeepTogether([Paragraph("<b>Resumen</b>", styles["Bold"]), Spacer(1, 2), tabla_resumen]))
+        story.append(Spacer(1, 8))
+
+        # Top observaciones
+        top_obs = [["Observación", "Veces"]]
+        for obs, cnt in resumen["obs_counter"].most_common(10):
+            top_obs.append([obs, cnt if cnt else 0])
+        if len(top_obs) == 1:
+            top_obs.append(["(Sin observaciones registradas)", 0])
+
+        tabla_obs = Table(top_obs, colWidths=[140*mm, 20*mm])
+        tabla_obs.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#eef2ff")),
+            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("ALIGN", (1,1), (1,-1), "RIGHT"),
+            ("VALIGN", (0,0), (-1,-1), "TOP"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("LEFTPADDING", (0,0), (-1,-1), 5),
+            ("RIGHTPADDING", (0,0), (-1,-1), 5),
+        ]))
+        story.append(KeepTogether([Paragraph("<b>Observaciones de Ingreso y Salida (Top 10)</b>", styles["Bold"]), Spacer(1, 2), tabla_obs]))
+        story.append(Spacer(1, 8))
+
+        # Tabla de días
+        encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Min. Atraso Día", "Observación"]
+        tabla_data = [encabezados] + datos_tabla
+        col_widths = [28*mm, 20*mm, 20*mm, 24*mm, 26*mm, 150*mm]
+        tabla = Table(tabla_data, colWidths=col_widths, repeatRows=1)
+        tabla.setStyle(TableStyle([
+            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e2e8f0")),
+            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+            ("ALIGN", (1,1), (3,-1), "CENTER"),
+            ("ALIGN", (4,1), (4,-1), "RIGHT"),
+            ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+            ("FONTSIZE", (0,0), (-1,-1), 9),
+            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+            ("LEFTPADDING", (0,0), (-1,-1), 4),
+            ("RIGHTPADDING", (0,0), (-1,-1), 4),
+        ]))
+        story.append(Paragraph("<b>Detalle Diario</b>", styles["Bold"]))
+        story.append(Spacer(1, 2))
+        story.append(tabla)
+
+        # Render
+        doc.build(story)
+
+        # Guarda ruta del último PDF para el botón "Enviar por Correo"
+        frame._ultimo_pdf_path = ruta
+        if abrir:
+            messagebox.showinfo("PDF generado", f"PDF guardado en Descargas:\n{os.path.basename(ruta)}")
+            try:
+                os.startfile(ruta)  # Windows
+            except Exception:
+                pass
+        return ruta
+
+    # -------- Construir filas para PDF --------
+    def construir_datos_pdf(regs_por_dia, rut):
+        datos = []
+        for fecha in sorted(regs_por_dia):
+            info = regs_por_dia[fecha]
+            ingreso = info.get("ingreso", "--") or "--"
+            salida = info.get("salida", "--") or "--"
+            obs_ingreso = info.get("obs_ingreso", "") or ""
+            obs_salida = info.get("obs_salida", "") or ""
+            obs_txt = (obs_ingreso + (" | " if obs_ingreso and obs_salida else "") + obs_salida).strip()
+
+            # atraso día
+            min_atraso = 0
+            if ingreso != "--":
+                try:
+                    fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
+                    nombre_dia = fecha_dt.strftime("%A")
+                    dias_map = {
+                        "Monday": "Lunes", "Tuesday": "Martes", "Wednesday": "Miércoles",
+                        "Thursday": "Jueves", "Friday": "Viernes", "Saturday": "Sábado", "Sunday": "Domingo"
+                    }
+                    nombre_dia_es = dias_map.get(nombre_dia, "")
+                    con = sqlite3.connect("reloj_control.db")
+                    cur = con.cursor()
+                    cur.execute("""
+                        SELECT hora_entrada FROM horarios
+                        WHERE rut = ? AND dia = ?
+                    """, (rut, nombre_dia_es))
+                    res = cur.fetchone()
+                    con.close()
+                    if res:
+                        h_esp = res[0]
+                        t_i = _ph_any(ingreso)
+                        t_e = _ph_any(h_esp)
+                        if t_i and t_e:
+                            base = fecha_dt.date()
+                            t_i2 = datetime.combine(base, t_i.time())
+                            t_e2 = datetime.combine(base, t_e.time())
+                            delta = (t_i2 - t_e2).total_seconds()
+                            if delta > 300:
+                                min_atraso = math.ceil((delta - 300) / 60.0)
+                except Exception:
+                    pass
+
+            # trabajado
+            trabajado = info.get("trabajado", "")
+            if not trabajado or trabajado == "0h 0min":
+                if ingreso != "--" and salida != "--":
+                    t1 = parse_hora_flexible(ingreso)
+                    t2 = parse_hora_flexible(salida)
+                    if t1 and t2:
+                        mins = int((t2 - t1).total_seconds() // 60)
+                        h_, m_ = divmod(mins, 60)
+                        trabajado = f"{h_:02d}:{m_:02d}"
+                    else:
+                        trabajado = "--:--"
+                else:
+                    trabajado = "--:--"
+            else:
+                if "h" in trabajado:
+                    try:
+                        h__, m__ = trabajado.replace("min", "").split("h")
+                        trabajado = f"{int(h__.strip()):02d}:{int(m__.strip()):02d}"
+                    except Exception:
+                        pass
+
+            datos.append([
+                datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y"),
+                ingreso, salida, trabajado, min_atraso, obs_txt
+            ])
+        return datos
+
+    # -------- Ventana "Enviar por Correo" --------
+    def abrir_envio_correo():
+        ctx = getattr(frame, "_ultimo_contexto_pdf", None)
+
+        if not ctx:
+            messagebox.showwarning("Sin datos", "Primero genera un reporte (Buscar Reporte).")
+            return
+
+        # Si no hay PDF reciente, generarlo silenciosamente
+        ultimo_pdf = getattr(frame, "_ultimo_pdf_path", None)
+        if (not ultimo_pdf or not os.path.exists(ultimo_pdf)) and HAS_PDF:
+            try:
+                ultimo_pdf = exportar_pdf(
+                    rut=ctx["rut"],
+                    nombre=ctx["nombre"],
+                    apellido=ctx["apellido"],
+                    cargo=ctx["cargo"],
+                    periodo=ctx["periodo"],
+                    datos_tabla=ctx["datos_tabla"],
+                    resumen=ctx["resumen"],
+                    abrir=False
+                )
+            except Exception:
+                ultimo_pdf = None
+
+        TopLevelCls = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
+        master = frame.winfo_toplevel()
+        win = TopLevelCls(master)
+        win.title("✉️ Enviar por Correo")
+        try:
+            win.resizable(False, False)
+            win.transient(master)
+            win.grab_set()
+        except Exception:
+            pass
+
+        cont = ctk.CTkFrame(win, corner_radius=12)
+        cont.pack(fill="both", expand=True, padx=16, pady=16)
+
+        # Para / CC / Asunto / Mensaje
+        ctk.CTkLabel(cont, text="Destinatarios", font=("Arial", 16, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0,8))
+
+        ctk.CTkLabel(cont, text="Para:").grid(row=1, column=0, sticky="e", padx=(0,8), pady=6)
+        entry_to = ctk.CTkEntry(cont, width=420, placeholder_text="correo@dominio.cl; otro@dominio.cl")
+        entry_to.grid(row=1, column=1, sticky="w", pady=6)
+
+        ctk.CTkLabel(cont, text="CC:").grid(row=2, column=0, sticky="e", padx=(0,8), pady=(0,6))
+        entry_cc = ctk.CTkEntry(cont, width=420, placeholder_text="(opcional)")
+        entry_cc.grid(row=2, column=1, sticky="w", pady=(0,6))
+
+        # Sugerir correo del trabajador (si existe)
+        try:
+            conx = sqlite3.connect("reloj_control.db")
+            curx = conx.cursor()
+            curx.execute("PRAGMA table_info(trabajadores)")
+            cols = {c[1].lower() for c in curx.fetchall()}
+            if "correo" in cols:
+                curx.execute("SELECT correo FROM trabajadores WHERE rut=?", (ctx["rut"],))
+                row = curx.fetchone()
+                if row and row[0] and "@" in row[0]:
+                    entry_to.insert(0, row[0].strip())
+            conx.close()
+        except Exception:
+            pass
+
+        ctk.CTkLabel(cont, text="Asunto:").grid(row=3, column=0, sticky="e", padx=(0,8), pady=(4,6))
+        asunto_def = f"Reporte de asistencia – {ctx['identidad']} – {ctx['periodo']}"
+        entry_subject = ctk.CTkEntry(cont, width=420)
+        entry_subject.grid(row=3, column=1, sticky="w", pady=(4,6))
+        entry_subject.insert(0, asunto_def)
+
+        ctk.CTkLabel(cont, text="Mensaje:").grid(row=4, column=0, sticky="ne", padx=(0,8), pady=(4,6))
+        Textbox = getattr(ctk, "CTkTextbox", None)
+        if Textbox:
+            txt_msg = Textbox(cont, width=420, height=150)
+            txt_msg.grid(row=4, column=1, sticky="w", pady=(4,6))
+            msg_def = (
+                f"Estimado(a):\n\nAdjunto el reporte de asistencia correspondiente al período {ctx['periodo']}.\n"
+                f"Funcionario: {ctx['identidad']}\n\nSaludos cordiales."
+            )
+            txt_msg.insert("1.0", msg_def)
+        else:
+            wrap = tk.Frame(cont); wrap.grid(row=4, column=1, sticky="w", pady=(4,6))
+            txt_msg = tk.Text(wrap, width=56, height=8)
+            txt_msg.pack()
+            txt_msg.insert("1.0", msg_def)
+
+        # Adjuntar
+        row5 = ctk.CTkFrame(cont, fg_color="transparent"); row5.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6,8))
+        var_adj = tk.BooleanVar(value=True)
+        adj_label = os.path.basename(ultimo_pdf) if (ultimo_pdf and os.path.exists(ultimo_pdf)) else "(se generará PDF)"
+        ctk.CTkCheckBox(row5, text=f"Adjuntar PDF: {adj_label}", variable=var_adj).pack(anchor="w")
+
+        # Botones
+        btns = ctk.CTkFrame(cont, fg_color="transparent"); btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10,0))
+        ctk.CTkButton(btns, text="Cancelar", fg_color="#475569", command=win.destroy, width=120).pack(side="left", padx=(0,6))
+
+        def _enviar():
+            to_raw = entry_to.get().strip()
+            cc_raw = entry_cc.get().strip()
+            subject = entry_subject.get().strip() or "Reporte de asistencia"
+            body = txt_msg.get("1.0", "end").strip()
+            if not to_raw:
+                messagebox.showwarning("Falta destinatario", "Ingresa al menos un correo en 'Para'.")
+                return
+            to_list = [p.strip() for p in to_raw.replace(",", ";").split(";") if p.strip()]
+            cc_list = [c.strip() for c in cc_raw.replace(",", ";").split(";") if c.strip()]
+
+            # Generar si no hay PDF y el usuario quiere adjuntar
+            attach_path = None
+            if var_adj.get():
+                nonlocal_pdf = getattr(frame, "_ultimo_pdf_path", None)
+                if not nonlocal_pdf or not os.path.exists(nonlocal_pdf):
+                    try:
+                        nonlocal_pdf = exportar_pdf(
+                            rut=ctx["rut"],
+                            nombre=ctx["nombre"],
+                            apellido=ctx["apellido"],
+                            cargo=ctx["cargo"],
+                            periodo=ctx["periodo"],
+                            datos_tabla=ctx["datos_tabla"],
+                            resumen=ctx["resumen"],
+                            abrir=False
+                        )
+                    except Exception as e:
+                        messagebox.showerror("PDF", f"No se pudo generar el PDF para adjuntar:\n{e}")
+                        return
+                attach_path = nonlocal_pdf
+
+            try:
+                html = _html_email_informe(ctx["periodo"], ctx["identidad"])
+                _smtp_send(
+                    to_list=to_list,
+                    cc_list=cc_list,
+                    subject=subject,
+                    body_text=body,
+                    html_body=html,
+                    attachment_path=attach_path
+                )
+                messagebox.showinfo("Envío exitoso", "Correo enviado correctamente.")
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
+                win.destroy()
+            except Exception as e:
+                messagebox.showerror("Error al enviar", f"No fue posible enviar el correo:\n{e}")
+
+        ctk.CTkButton(btns, text="Enviar", fg_color="#22c55e", command=_enviar, width=160).pack(side="right", padx=(6,0))
+
+        cont.grid_columnconfigure(1, weight=1)
+
+        # Geometría / foco
+        master.update_idletasks()
+        w, h = 640, 460
+        x = master.winfo_x() + (master.winfo_width() // 2) - (w // 2)
+        y = master.winfo_y() + (master.winfo_height() // 2) - (h // 2)
+        win.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
+        win.bind("<Return>", lambda e: _enviar())
+        try:
+            entry_to.focus_set()
+        except Exception:
+            pass
+
+    # -------- Lógica de búsqueda y render --------
     def buscar_reportes():
-        nonlocal registros_por_dia, modo_exportable, label_estado, label_datos, label_total, label_leyenda_admin, label_total_semana, label_pactadas, label_completadas
+        nonlocal registros_por_dia, label_estado, label_datos, label_total, label_total_semana, label_pactadas, label_completadas, label_resumen
         rut = entry_rut.get().strip()
         fecha_desde = entry_desde.get().strip()
         fecha_hasta = entry_hasta.get().strip()
@@ -418,10 +994,8 @@ def construir_reportes(frame_padre):
         info_trabajador = get_info_trabajador(conexion, rut)
 
         if info_trabajador:
-            nombre, apellido, profesion = info_trabajador
-            label_datos.configure(
-                text=f"RUT: {rut}\nNombre: {nombre} {apellido}\nProfesión: {profesion}"
-            )
+            nombre, apellido, profesion, correo = info_trabajador
+            label_datos.configure(text=f"RUT: {rut}\nNombre: {nombre} {apellido}\nProfesión: {profesion}")
         else:
             label_datos.configure(text="RUT no encontrado")
             label_estado.configure(text="⚠️ RUT no registrado", text_color="orange")
@@ -431,13 +1005,11 @@ def construir_reportes(frame_padre):
         if not fecha_desde or not fecha_hasta:
             hoy = datetime.today()
             desde_dt = hoy.replace(day=1)
-            hasta_dt = hoy + timedelta(days=45)
-            modo_exportable = True
+            hasta_dt = (hoy + timedelta(days=45)).replace(day=1)
         else:
             try:
                 desde_dt = datetime.strptime(fecha_desde, "%d/%m/%Y")
                 hasta_dt = datetime.strptime(fecha_hasta, "%d/%m/%Y")
-                modo_exportable = True
             except ValueError:
                 label_estado.configure(text="⚠️ Formato de fecha incorrecto", text_color="red")
                 conexion.close()
@@ -485,7 +1057,7 @@ def construir_reportes(frame_padre):
                 }
             dia += timedelta(days=1)
 
-        # Completar faltantes sin marcas
+        # Completar días vacíos
         dia = desde_dt.date()
         while dia <= hasta_dt.date():
             fiso = dia.isoformat()
@@ -499,7 +1071,7 @@ def construir_reportes(frame_padre):
                 }
             dia += timedelta(days=1)
 
-        # Regla: "Cometido" → autocompletar salida con horario pactado
+        # Regla Cometido: autocompletar salida con horario pactado
         for fecha, info in registros_por_dia.items():
             obs_txt = (info.get("obs_ingreso") or "") + " " + (info.get("obs_salida") or "") + " " + (info.get("motivo") or "")
             obs_txt = obs_txt.lower()
@@ -519,8 +1091,8 @@ def construir_reportes(frame_padre):
                 t2 = parse_hora_flexible(salida_horario)
                 if t1 and t2:
                     mins = int((t2 - t1).total_seconds() // 60)
-                    h, m = divmod(mins, 60)
-                    info["trabajado"] = f"{h}h {m}min"
+                    h_, m_ = divmod(mins, 60)
+                    info["trabajado"] = f"{h_}h {m_}min"
                 else:
                     info["trabajado"] = obtener_horas_administrativo(rut, fecha_dt)
 
@@ -528,7 +1100,7 @@ def construir_reportes(frame_padre):
                 if not info.get("obs_salida"):
                     info["obs_salida"] = "Salida autocompletada por Cometido"
 
-        # -------- Render de la tabla --------
+        # ---- Render tabla en pantalla
         if registros_por_dia:
             encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Obs. Ingreso", "Obs. Salida"]
             for col, texto in enumerate(encabezados):
@@ -543,7 +1115,6 @@ def construir_reportes(frame_padre):
                 obs_salida = registros_por_dia[fecha].get("obs_salida", "")
                 es_admin = registros_por_dia[fecha].get("es_admin", False)
                 es_fer = registros_por_dia[fecha].get("es_feriado", False)
-
                 trabajado = registros_por_dia[fecha].get("trabajado", "0h 0min")
 
                 if not es_admin and ingreso not in (None, "--") and salida not in (None, "--"):
@@ -552,8 +1123,8 @@ def construir_reportes(frame_padre):
                     if t1 and t2:
                         duracion = (t2 - t1)
                         minutos = int(duracion.total_seconds() // 60)
-                        h, m = divmod(minutos, 60)
-                        trabajado = f"{int(h)}h {int(m)}min"
+                        h_, m_ = divmod(minutos, 60)
+                        trabajado = f"{int(h_)}h {int(m_)}min"
                         registros_por_dia[fecha]["trabajado"] = trabajado
                         total_minutos += int(minutos)
                     else:
@@ -565,21 +1136,13 @@ def construir_reportes(frame_padre):
                         registros_por_dia[fecha]["trabajado"] = trabajado
 
                 fecha_legible = datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y")
-                fila_datos = [
-                    fecha_legible,
-                    ingreso or "--",
-                    salida or "--",
-                    trabajado,
-                    obs_ingreso or "",
-                    obs_salida or ""
-                ]
-
+                fila_datos = [fecha_legible, ingreso or "--", salida or "--", trabajado, obs_ingreso or "", obs_salida or ""]
                 for col, val in enumerate(fila_datos):
                     color = None
                     if es_fer:
-                        color = "#00aaff"  # azul feriado
+                        color = "#00aaff"
                     elif es_admin:
-                        color = "#00bfff"  # celeste admin
+                        color = "#00bfff"
                     elif col == 3 and trabajado != "0h 0min":
                         color = "green"
                     elif col == 3 and trabajado == "0h 0min":
@@ -591,15 +1154,14 @@ def construir_reportes(frame_padre):
                         ctk.CTkLabel(frame_tabla, text=val).grid(row=fila, column=col, padx=10, pady=2)
                 fila += 1
 
-            # Total del rango (mes/periodo)
+            # Totales de rango mostrado
             h_tot, m_tot = divmod(int(total_minutos), 60)
-            label_total.configure(text=f"Total trabajado en el mes: {int(h_tot)}h {int(m_tot)}min", text_color="white")
+            label_total.configure(text=f"Total trabajado en el período (efectivo en tabla): {int(h_tot)}h {int(m_tot)}min", text_color="white")
 
-            # === Total semanal efectivo (según registros)
+            # Total semanal (visual)
             hoy = datetime.today().date()
-            inicio_semana = hoy - timedelta(days=hoy.weekday())  # Lunes
-            fin_semana = inicio_semana + timedelta(days=6)       # Domingo
-
+            inicio_semana = hoy - timedelta(days=hoy.weekday())
+            fin_semana = inicio_semana + timedelta(days=6)
             minutos_semana = 0
             for f, info in registros_por_dia.items():
                 fecha_dt = datetime.strptime(f, "%Y-%m-%d").date()
@@ -621,29 +1183,71 @@ def construir_reportes(frame_padre):
             h_sem, m_sem = divmod(int(minutos_semana), 60)
             label_total_semana.configure(text=f"Total trabajado en la semana (efectivo): {h_sem}h {m_sem}min")
 
-            # === Carga Horaria (según horarios semanales, con ajuste especial 43/44 si aplica)
+            # Carga Horaria semanal
             minutos_carga = calcular_carga_horaria_semana(rut)
             h_pac, m_pac = divmod(int(minutos_carga), 60)
-
             cumple = minutos_semana >= minutos_carga
-            label_pactadas.configure(text=f"Carga Horaria: {h_pac}h {m_pac:02d}min")
+            label_pactadas.configure(text=f"Carga Horaria (semanal): {h_pac}h {m_pac:02d}min")
             label_completadas.configure(
                 text=f"Horas completadas esta semana: {h_sem}h {m_sem:02d}min",
                 text_color="green" if cumple else "orange"
             )
 
+            # Resumen para PDF
+            resumen = calcular_estadisticas_periodo(rut, registros_por_dia, desde_dt, hasta_dt)
+            h_all, m_all = divmod(int(resumen["total_min_trabajados"]), 60)
+            label_resumen.configure(
+                text=(
+                    f"Resumen (período): Trabajado {h_all:02d}:{m_all:02d} | "
+                    f"Atraso {resumen['total_min_atraso']} min | "
+                    f"Admin usados {resumen['dias_admin_usados']} | "
+                    f"Admin pendientes {'—' if resumen['dias_admin_pendientes'] is None else resumen['dias_admin_pendientes']} | "
+                    f"Feriados {resumen['feriados']} | Completos {resumen['dias_ok']} | Incompletos {resumen['dias_incompletos']}"
+                )
+            )
+
+            # Guardamos contexto para PDF y Email
+            frame._ultimo_contexto_pdf = {
+                "rut": rut,
+                "nombre": nombre,
+                "apellido": apellido,
+                "cargo": profesion,
+                "identidad": f"{nombre} {apellido}",
+                "periodo": f"{desde_dt.strftime('%d/%m/%Y')} a {hasta_dt.strftime('%d/%m/%Y')}",
+                "datos_tabla": construir_datos_pdf(registros_por_dia, rut),
+                "resumen": resumen
+            }
+            # Limpia la ruta del anterior PDF hasta que se genere uno nuevo
+            frame._ultimo_pdf_path = None
+
             label_estado.configure(text="✅ Reporte generado", text_color="green")
         else:
-            # Fallback (sin marcas)
-            label_total.configure(text="Total trabajado en el mes: 0h 0min", text_color="white")
+            label_total.configure(text="Total trabajado en el período (efectivo en tabla): 0h 0min", text_color="white")
             label_total_semana.configure(text="Total trabajado en la semana (efectivo): 0h 0min")
-
             minutos_carga = calcular_carga_horaria_semana(rut)
             h_pac, m_pac = divmod(int(minutos_carga), 60)
-            label_pactadas.configure(text=f"Carga Horaria: {h_pac}h {m_pac:02d}min")
+            label_pactadas.configure(text=f"Carga Horaria (semanal): {h_pac}h {m_pac:02d}min")
             label_completadas.configure(text="Horas completadas esta semana: 0h 00min", text_color="orange")
-
+            label_resumen.configure(text="Resumen (período): —")
+            frame._ultimo_contexto_pdf = None
+            frame._ultimo_pdf_path = None
             label_estado.configure(text="✅ Reporte generado (sin marcas)", text_color="green")
+
+    def exportar_pdf_click():
+        ctx = getattr(frame, "_ultimo_contexto_pdf", None)
+        if not ctx:
+            messagebox.showwarning("Sin datos", "Primero genera un reporte (Buscar Reporte).")
+            return
+        exportar_pdf(
+            rut=ctx["rut"],
+            nombre=ctx["nombre"],
+            apellido=ctx["apellido"],
+            cargo=ctx["cargo"],
+            periodo=ctx["periodo"],
+            datos_tabla=ctx["datos_tabla"],
+            resumen=ctx["resumen"],
+            abrir=True
+        )
 
     # === INTERFAZ ===
     frame = ctk.CTkFrame(frame_padre)
@@ -729,7 +1333,8 @@ def construir_reportes(frame_padre):
     ctk.CTkButton(cont_fecha_hasta, text="📅", width=40, command=lambda: seleccionar_fecha(entry_hasta)).pack(side="left", padx=5)
 
     ctk.CTkButton(frame, text="Buscar Reporte", command=buscar_reportes).pack(pady=5)
-    ctk.CTkButton(frame, text="Exportar Excel", command=exportar_excel).pack(pady=5)
+    ctk.CTkButton(frame, text="Exportar PDF", command=exportar_pdf_click).pack(pady=(5, 2))
+    ctk.CTkButton(frame, text="Enviar por Correo", command=abrir_envio_correo).pack(pady=(2, 5))
 
     label_datos = ctk.CTkLabel(frame, text="RUT: ---\nNombre: ---\nProfesión: ---", font=("Arial", 13), justify="left")
     label_datos.pack(pady=10)
@@ -749,8 +1354,8 @@ def construir_reportes(frame_padre):
     label_completadas = ctk.CTkLabel(frame, text="", font=("Arial", 12))
     label_completadas.pack(pady=2)
 
-    label_leyenda_admin = ctk.CTkLabel(frame, text="", font=("Arial", 12))
-    label_leyenda_admin.pack(pady=2)
+    label_resumen = ctk.CTkLabel(frame, text="", font=("Arial", 12), justify="left")
+    label_resumen.pack(pady=4)
 
     label_estado = ctk.CTkLabel(frame, text="")
     label_estado.pack(pady=10)
