@@ -32,8 +32,10 @@ except Exception:
     HAS_TKCAL = False
 
 # -------------------- Paths base --------------------
+# -------------------- Paths base --------------------
 def app_path():
-    return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+    return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+           else os.path.dirname(os.path.abspath(__file__))
 
 BASE = app_path()
 DB_PATH = os.path.join(BASE, "reloj_control.db")
@@ -303,7 +305,7 @@ def _pdf_simple_fallback(path_out: str, datos: dict):
 
 def nombre_archivo_por_formato(fecha: datetime.date, folio: int, usar_ddmmyyyy=True):
     fecha_str = fecha.strftime("%d%m%Y") if usar_ddmmyyyy else fecha.strftime("%Y%m%d")
-    return f"{fecha_str}_F{folio:06}.pdf"
+    return f"{fecha_str}_F{folio:06d}.pdf"
 
 def _build_pdf_solicitud(folio: int, rut: str, nombre: str, cargo: str, tipo: str,
                          desde: datetime.date, hasta: datetime.date, observacion: str) -> str | None:
