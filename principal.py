@@ -13,27 +13,38 @@ from solicitudes import construir_solicitudes
 from cambio_clave_admin import abrir_cambio_clave
 from dia_administrativo import construir_dia_administrativo
 
-# ========== Inicializar base de datos ==========
-crear_bd()
+# ========== Utilidades de ruta ==========
+def app_path() -> str:
+    # En .exe: carpeta del ejecutable; en .py: carpeta del archivo
+    return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+           else os.path.dirname(os.path.abspath(__file__))
 
-# ========== Configuración general ==========
+BASE = app_path()
+# Fijar directorio de trabajo (crítico para rutas relativas como "reloj_control.db")
+os.chdir(BASE)
+
+DB_PATH = os.path.join(BASE, "reloj_control.db")
+CARPETA_ROSTROS = os.path.join(BASE, "rostros")
+MODELS_PATH = os.path.join(BASE, "face_recognition_models")
+
+# ========== Configuración general de UI ==========
 ctk.set_appearance_mode("System")
 ctk.set_default_color_theme("blue")
 
 admin_info = None  # Almacena los datos del administrador logueado
 
-def app_path():
-    return os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
-
-BASE = app_path()
-DB_PATH = os.path.join(BASE, "reloj_control.db")
-CARPETA_ROSTROS = os.path.join(BASE, "rostros")
-MODELS_PATH = os.path.join(BASE, "face_recognition_models")
-
 # ========== Ventana ==========
 app = ctk.CTk()
 app.geometry("1200x600")
 app.title("BioAccess/Control de Horarios | www.bioaccess.cl")
+
+# ========== Inicializar base de datos ==========
+try:
+    crear_bd(DB_PATH)   # <<--- ahora recibe la ruta
+except Exception as e:
+    messagebox.showerror("Base de datos", f"No se pudo crear/abrir la BD:\n{e}")
+    app.destroy()
+    sys.exit(1)
 
 # ========== Helpers ==========
 def safe_focus(widget):
@@ -110,13 +121,14 @@ def mostrar_editar_usuario():
     from editar_usuario import construir_edicion
     construir_edicion(
         frame_contenedor,
-        on_actualizacion=actualizar_contador,              # sigue refrescando el contador
-        on_volver_inicio=lambda: [                         # <<--- ESTA LÍNEA ES LA CLAVE
-            mostrar_ingreso_salida(),                      # vuelve a la pantalla de Ingreso/Salida
-            resaltar_boton_activo("ingreso")               # y marca el botón activo
+        on_actualizacion=actualizar_contador,
+        on_volver_inicio=lambda: [
+            mostrar_ingreso_salida(),
+            resaltar_boton_activo("ingreso")
         ]
     )
-# ========== Ventana de Bienvenida (moderna, centrada, fade-in, autocierre) ==========
+
+# ========== Ventana de Bienvenida ==========
 def mostrar_bienvenida(nombre: str, autoclose_ms: int = 2500):
     TopLevelCls = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
     win = TopLevelCls(app)
@@ -131,7 +143,8 @@ def mostrar_bienvenida(nombre: str, autoclose_ms: int = 2500):
     cont = ctk.CTkFrame(win, corner_radius=12)
     cont.pack(fill="both", expand=True, padx=16, pady=16)
 
-    lbl = ctk.CTkLabel(cont, text=f"Bienvenido: {nombre}", font=("Arial", 18, "bold"), text_color="lightgreen")
+    lbl = ctk.CTkLabel(cont, text=f"Bienvenido: {nombre}",
+                       font=("Arial", 18, "bold"), text_color="lightgreen")
     lbl.pack(pady=(20, 10))
 
     def cerrar_bienvenida():
@@ -142,7 +155,7 @@ def mostrar_bienvenida(nombre: str, autoclose_ms: int = 2500):
     btn = ctk.CTkButton(cont, text="Aceptar", command=cerrar_bienvenida)
     btn.pack(pady=(0, 16))
 
-    # Centrar
+    # Centrado
     app.update_idletasks()
     w, h = 340, 160
     try:
@@ -153,9 +166,8 @@ def mostrar_bienvenida(nombre: str, autoclose_ms: int = 2500):
     x = app.winfo_x() + (app.winfo_width() // 2) - (w // 2)
     y = app.winfo_y() + (app.winfo_height() // 2) - (h // 2)
     win.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
-    
 
-    # Fade-in seguro
+    # Fade-in
     try:
         win.attributes("-alpha", 0.0)
         def fade_in(a=0.0):
@@ -172,7 +184,6 @@ def mostrar_bienvenida(nombre: str, autoclose_ms: int = 2500):
     except Exception:
         pass
 
-    # Autocierre
     if autoclose_ms and autoclose_ms > 0:
         win.after(autoclose_ms, cerrar_bienvenida)
     win.bind("<Escape>", lambda e: cerrar_bienvenida())
@@ -205,7 +216,7 @@ btn_solicitud = ctk.CTkButton(
 btn_solicitud.pack(side="left", padx=5)
 botones_menu["solicitud"] = btn_solicitud
 
-# ========== Botones solo admin (se muestran tras login) ==========
+# ========== Botones solo admin ==========
 btn_registro = ctk.CTkButton(menu, text="Agregar Nuevo Usuario",
                              command=lambda: [mostrar_registro_con_refresco(), resaltar_boton_activo("registro")])
 btn_reportes = ctk.CTkButton(menu, text="Reportes",
@@ -227,7 +238,8 @@ botones_menu["panelavanzado"] = btn_panel_avanzado
 for btn in [btn_registro, btn_reportes, btn_nomina, btn_editar, btn_dia_admin, btn_panel_avanzado, btn_clave]:
     btn.pack_forget()
 
-btn_logout_admin = ctk.CTkButton(menu, text="Cerrar Sesión Admin", fg_color="gray", command=lambda: cerrar_sesion_admin())
+btn_logout_admin = ctk.CTkButton(menu, text="Cerrar Sesión Admin", fg_color="gray",
+                                 command=lambda: cerrar_sesion_admin())
 btn_logout_admin.pack_forget()
 
 def mostrar_opciones_admin():
@@ -263,19 +275,18 @@ def abrir_login_admin():
         pass
 
     usar_ctk = TopLevelCls is not tk.Toplevel
-    focus_after_id = None  # guardamos el after para cancelarlo al cerrar
+    focus_after_id = None
 
     def safe_close_login():
-        """Cierra el login sin carreras de foco (cancela after, withdraw y destruye con delay)."""
         nonlocal focus_after_id
         try:
             if focus_after_id:
                 login.after_cancel(focus_after_id)
         except Exception:
             pass
-        safe_focus(app)            # lleva el foco a la ventana principal
+        safe_focus(app)
         try:
-            login.withdraw()       # oculta para que cualquier after interno no falle
+            login.withdraw()
         except Exception:
             pass
         login.after(200, lambda: login.winfo_exists() and login.destroy())
@@ -284,8 +295,8 @@ def abrir_login_admin():
         cont = ctk.CTkFrame(login, corner_radius=12)
         cont.pack(fill="both", expand=True, padx=16, pady=16)
 
-        titulo = ctk.CTkLabel(cont, text="Ingreso de Administrador", font=("Arial", 18, "bold"))
-        titulo.grid(row=0, column=0, columnspan=2, pady=(4, 12))
+        ctk.CTkLabel(cont, text="Ingreso de Administrador",
+                     font=("Arial", 18, "bold")).grid(row=0, column=0, columnspan=2, pady=(4, 12))
 
         ctk.CTkLabel(cont, text="RUT").grid(row=1, column=0, sticky="w", padx=(4, 8))
         entry_rut = ctk.CTkEntry(cont, placeholder_text="12.345.678-9", width=220)
@@ -298,8 +309,8 @@ def abrir_login_admin():
         ver_var = tk.BooleanVar(value=False)
         def toggle_ver():
             entry_clave.configure(show="" if ver_var.get() else "*")
-        chk_ver = ctk.CTkCheckBox(cont, text="Mostrar", variable=ver_var, command=toggle_ver)
-        chk_ver.grid(row=3, column=1, sticky="w", pady=(0, 8))
+        ctk.CTkCheckBox(cont, text="Mostrar", variable=ver_var, command=toggle_ver)\
+            .grid(row=3, column=1, sticky="w", pady=(0, 8))
 
         def validar_admin():
             rut = entry_rut.get().strip()
@@ -320,14 +331,12 @@ def abrir_login_admin():
             else:
                 messagebox.showerror("Error", "Credenciales incorrectas")
 
-        btn_cancelar = ctk.CTkButton(cont, text="Cancelar", fg_color="gray", command=safe_close_login)
-        btn_cancelar.grid(row=4, column=0, pady=(8, 0), padx=4, sticky="ew")
-
-        btn_entrar = ctk.CTkButton(cont, text="Entrar", command=validar_admin)
-        btn_entrar.grid(row=4, column=1, pady=(8, 0), padx=4, sticky="ew")
+        ctk.CTkButton(cont, text="Cancelar", fg_color="gray", command=safe_close_login)\
+            .grid(row=4, column=0, pady=(8, 0), padx=4, sticky="ew")
+        ctk.CTkButton(cont, text="Entrar", command=validar_admin)\
+            .grid(row=4, column=1, pady=(8, 0), padx=4, sticky="ew")
 
         cont.grid_columnconfigure(1, weight=1)
-        # foco inicial con after cancelable
         focus_after_id = login.after(80, lambda: safe_focus(entry_rut))
 
         login.bind("<Return>", lambda _: validar_admin())
@@ -341,15 +350,14 @@ def abrir_login_admin():
         marco = tk.Frame(login, padx=14, pady=14)
         marco.pack(fill="both", expand=True)
 
-        tk.Label(marco, text="Ingreso de Administrador", font=("Arial", 14, "bold")).grid(row=0, column=0, columnspan=2, pady=(0, 10))
+        tk.Label(marco, text="Ingreso de Administrador", font=("Arial", 14, "bold"))\
+            .grid(row=0, column=0, columnspan=2, pady=(0, 10))
 
         tk.Label(marco, text="RUT").grid(row=1, column=0, sticky="e", padx=(0, 8))
-        entry_rut = tk.Entry(marco, width=28)
-        entry_rut.grid(row=1, column=1, pady=4)
+        entry_rut = tk.Entry(marco, width=28); entry_rut.grid(row=1, column=1, pady=4)
 
         tk.Label(marco, text="Clave").grid(row=2, column=0, sticky="e", padx=(0, 8))
-        entry_clave = tk.Entry(marco, show="*", width=28)
-        entry_clave.grid(row=2, column=1, pady=4)
+        entry_clave = tk.Entry(marco, show="*", width=28); entry_clave.grid(row=2, column=1, pady=4)
 
         def validar_admin():
             rut = entry_rut.get().strip()
@@ -370,10 +378,12 @@ def abrir_login_admin():
             else:
                 messagebox.showerror("Error", "Credenciales incorrectas")
 
-        tk.Button(marco, text="Cancelar", command=safe_close_login).grid(row=3, column=0, pady=(10, 0), sticky="ew")
-        tk.Button(marco, text="Entrar", command=validar_admin).grid(row=3, column=1, pady=(10, 0), sticky="ew")
-        marco.grid_columnconfigure(1, weight=1)
+        tk.Button(marco, text="Cancelar", command=safe_close_login)\
+            .grid(row=3, column=0, pady=(10, 0), sticky="ew")
+        tk.Button(marco, text="Entrar", command=validar_admin)\
+            .grid(row=3, column=1, pady=(10, 0), sticky="ew")
 
+        marco.grid_columnconfigure(1, weight=1)
         focus_after_id = login.after(80, lambda: safe_focus(entry_rut))
         login.bind("<Return>", lambda _: validar_admin())
         login.bind("<Escape>", lambda _: safe_close_login())
@@ -382,7 +392,7 @@ def abrir_login_admin():
         except Exception:
             pass
 
-    # ------- Centro el diálogo de login --------
+    # Centrar el login
     app.update_idletasks()
     try:
         w = max(360, login.winfo_reqwidth() + 32)

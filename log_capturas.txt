@@ -40,3 +40,38 @@
 28/08/2025 17:24:55 - Captura (edición) 16632174-3 (5 muestras)
 04/09/2025 09:22:22 - Captura SIMPLE (edición) 16632174-3 (4 muestras)
 04/09/2025 09:45:27 - Captura SIMPLE (edición) 16632174-3 (4 muestras)
+[2025-09-05 12:04:08] Cámara abierta OK -> index=0, backend=700
+[2025-09-05 12:53:27] Cámara OK -> index=0, backend=DSHOW
+[2025-09-08 08:32:55] Inicio app | BASE=C:\Proyectos\RelojControl
+[2025-09-08 08:39:06] Inicio app | BASE=C:\Proyectos\RelojControl
+[2025-09-08 11:21:25] Inicio app | BASE=C:\Proyectos\RelojControl
+[2025-09-08 11:21:42] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 11:42:00] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 11:51:05] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 12:04:59] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 12:08:19] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 12:16:41] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 12:28:03] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 13:02:35] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 16:03:03] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 16:57:16] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 17:02:14] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 17:06:56] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 17:08:41] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 17:13:54] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-08 17:40:47] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-09 08:17:19] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-09 08:34:25] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-11 08:22:09] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-15 14:51:15] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-15 14:59:15] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-15 15:12:55] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-15 16:01:31] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-15 16:17:13] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-16 10:47:43] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-22 10:14:21] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-22 13:28:38] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-22 16:02:23] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-22 16:04:07] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-22 16:18:51] Inicio app | BASE=c:\Proyectos\RelojControl
+[2025-09-24 17:35:02] Inicio app | BASE=c:\Proyectos\RelojControl

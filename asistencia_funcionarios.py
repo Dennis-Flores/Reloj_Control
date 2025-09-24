@@ -398,6 +398,63 @@ def _build_pdf_asistencia_general(path_pdf, rows_data, period_text):
     doc.build(elems)
 
 
+def _fit_to_workarea(win, *, margin=8, bottom_pad=72):
+    """
+    Ajusta la ventana a la zona visible (work area) del monitor,
+    dejando un colchón inferior (bottom_pad) para no tocar la barra de tareas.
+    """
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left",   wintypes.LONG),
+                ("top",    wintypes.LONG),
+                ("right",  wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize",   wintypes.DWORD),
+                ("rcMonitor", RECT),
+                ("rcWork",    RECT),
+                ("dwFlags",   wintypes.DWORD),
+            ]
+
+        win.update_idletasks()
+        hwnd = wintypes.HWND(win.winfo_id())
+        MONITOR_DEFAULTTONEAREST = 2
+        hmon = user32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+        mi = MONITORINFO()
+        mi.cbSize = ctypes.sizeof(MONITORINFO)
+        if not user32.GetMonitorInfoW(hmon, ctypes.byref(mi)):
+            raise RuntimeError("GetMonitorInfoW failed")
+
+        # Work area (sin barra de tareas)
+        wl, wt = mi.rcWork.left, mi.rcWork.top
+        wr, wb = mi.rcWork.right, mi.rcWork.bottom
+
+        # Aplicamos márgenes laterales y un colchón inferior adicional
+        x = wl + margin
+        y = wt + margin
+        width  = max(300, (wr - wl) - margin*2)
+        height = max(200, (wb - wt) - margin - bottom_pad)
+
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        return True
+    except Exception:
+        try:
+            win.state("zoomed")
+        except Exception:
+            pass
+        return False
+
+
+
 # ================================================================
 # ===================   VENTANA PRINCIPAL   ======================
 # ================================================================
@@ -405,9 +462,23 @@ def abrir_asistencia(app_root, db_path: str, *, default_todos: bool = False):
     TopLevelCls = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
     win = TopLevelCls(app_root)
     win.title("Asistencia de Funcionarios")
+
+    # Ajuste al área de trabajo con colchón inferior
+    _fit_to_workarea(win, bottom_pad=72)
+    win.after(120, lambda: _fit_to_workarea(win, bottom_pad=72))
+
+    # Traer al frente
     try:
-        win.resizable(True, True); win.transient(app_root); win.grab_set()
-    except Exception: pass
+        win.transient(app_root)
+        win.lift()
+        win.focus_force()
+        win.attributes("-topmost", True)
+        win.after(300, lambda: win.attributes("-topmost", False))
+        win.grab_set()
+    except Exception:
+        pass
+
+
 
     cont = ctk.CTkFrame(win)
     cont.pack(fill="both", expand=True, padx=12, pady=12)
@@ -702,10 +773,3 @@ def abrir_asistencia(app_root, db_path: str, *, default_todos: bool = False):
         dlg.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
 
     btn_enviar.configure(command=enviar_correo)
-
-    # Centrar ventana principal
-    app_root.update_idletasks()
-    w,h = 980, 620
-    x = app_root.winfo_x() + (app_root.winfo_width() // 2) - (w // 2)
-    y = app_root.winfo_y() + (app_root.winfo_height() // 2) - (h // 2)
-    win.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")

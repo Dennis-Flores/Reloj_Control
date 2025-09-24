@@ -1,49 +1,65 @@
 @echo off
-setlocal
+setlocal ENABLEDELAYEDEXPANSION
+title Build BioAccess (Debug/Console)
 
-set PROY=C:\Proyectos\RelojControl
-set BUILD=C:\Proyectos\RelojControl_build_console
-set DIST=%BUILD%\dist
-set RELEASE=C:\Proyectos\RelojControl_release_console
-
-if exist "%BUILD%" rmdir /s /q "%BUILD%"
-mkdir "%BUILD%"
-
-cd /d "%PROY%"
-
-pyinstaller ^
- --noconfirm ^
- --console ^
- --onefile ^
- --name BioAccessConsole ^
- --icon "%PROY%\assets\bioaccess.ico" ^
- --distpath "%DIST%" ^
- --workpath "%BUILD%\build" ^
- --specpath "%BUILD%" ^
- --add-data "%PROY%\face_recognition_models;face_recognition_models" ^
- --collect-data tkcalendar ^
- --collect-data customtkinter ^
- --collect-submodules cv2 ^
- "%PROY%\principal.py"
-if errorlevel 1 ( echo ERROR de compilacion & pause & exit /b 1 )
-
-if exist "%RELEASE%" rmdir /s /q "%RELEASE%"
-mkdir "%RELEASE%"
-
-copy "%DIST%\BioAccessConsole.exe" "%RELEASE%\BioAccessConsole.exe" >nul
-
-REM Copia DB y carpetas que tu app usa/crea
-if exist "%PROY%\reloj_control.db" copy "%PROY%\reloj_control.db" "%RELEASE%\reloj_control.db" >nul
-if exist "%PROY%\formularios" xcopy "%PROY%\formularios" "%RELEASE%\formularios" /E /I /Y >nul
-mkdir "%RELEASE%\rostros"
-mkdir "%RELEASE%\salidas_solicitudes"
-mkdir "%RELEASE%\exportes_horario"
-
-REM Copiar DLL de video de OpenCV si existe (ajusta ruta si difiere)
-for %%D in ("%USERPROFILE%\AppData\Local\Programs\Python\Python3*\Lib\site-packages\cv2\opencv_videoio_ffmpeg*.dll") do (
-  copy "%%~fD" "%RELEASE%\" >nul
+set "NAME=BioAccess_Debug"
+set "PY=.\.venv\Scripts\python.exe"
+if not exist ".\.venv\Scripts\python.exe" (
+  echo [!] No se encontro .venv\Scripts\python.exe. Usare 'python' del sistema.
+  set "PY=python"
 )
 
-echo Listo: %RELEASE%\BioAccessConsole.exe
+rmdir /s /q build  2>nul
+rmdir /s /q dist   2>nul
+del /q "%NAME%.spec" 2>nul
+
+%PY% -m pip install -U pip setuptools wheel pyinstaller
+
+rem -- Construye add-data solo si existen las carpetas
+set "ADD_DATA="
+for %%D in ("assets" "face_recognition_models" "rostros" "salidas_solicitudes" "formularios") do (
+  if exist "%%~fD" set "ADD_DATA=!ADD_DATA! --add-data ""%%~fD;%%~nxD"""
+)
+echo === ADD_DATA: !ADD_DATA!
+
+%PY% -m PyInstaller ^
+  --noconfirm ^
+  --clean ^
+  --name "%NAME%" ^
+  --console ^
+  --icon assets\bioaccess.ico ^
+  --hidden-import=pkg_resources ^
+  --hidden-import=asistencia_funcionarios ^
+  --hidden-import=asistencia_diaria ^
+  --collect-all customtkinter ^
+  --collect-all tkcalendar ^
+  --collect-all face_recognition ^
+  --collect-all dlib ^
+  --collect-all cv2 ^
+  --collect-all PIL ^
+  --collect-all pandas ^
+  --collect-all numpy ^
+  --collect-all openpyxl ^
+  --collect-all xlsxwriter ^
+  --collect-all reportlab ^
+  --collect-data face_recognition_models ^
+  --collect-data tkcalendar ^
+  --collect-binaries cv2 ^
+  !ADD_DATA! ^
+  principal.py
+
+if errorlevel 1 (
+  echo ❌ PyInstaller fallo. Revisa el log.
+  pause & exit /b 1
+)
+
+if exist reloj_control.db copy /Y reloj_control.db "dist\%NAME%\reloj_control.db" >nul
+
+for %%D in ("rostros" "salidas_solicitudes") do (
+  if not exist "dist\%NAME%\%%~nxD" mkdir "dist\%NAME%\%%~nxD"
+)
+
+echo(
+echo ✅ Debug listo con consola.
+echo ▶️ Ejecutable: dist\%NAME%\%NAME%.exe
 pause
-endlocal

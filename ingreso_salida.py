@@ -9,35 +9,67 @@ import sqlite3
 import tkinter as tk
 import pickle
 import cv2
+import time
 from datetime import datetime, timedelta
 
-from feriados import es_feriado  # <- NUEVO
+from feriados import es_feriado
 
-# === SETUP MODELOS ===
-if getattr(sys, 'frozen', False):
-    ruta_base = sys._MEIPASS
-else:
-    ruta_base = os.path.dirname(__file__)
+# ======== OpenCV: forzar backend estable y silenciar logs ========
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_MSMF", "0")
+os.environ.setdefault("OPENCV_LOG_LEVEL", "SILENT")
 
-origen_dat = os.path.join(ruta_base, "face_recognition_models", "models", "shape_predictor_68_face_landmarks.dat")
-destino_dir = os.path.join(os.environ.get("TEMP"), "face_recognition_models", "models")
-os.makedirs(destino_dir, exist_ok=True)
-destino_dat = os.path.join(destino_dir, "shape_predictor_68_face_landmarks.dat")
+# ============== RUTAS ROBUSTAS PARA EJECUTABLE / INTERPRETADO ==============
+def _base_dir():
+    # En onedir: carpeta del .exe; en interpretado: carpeta del .py
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
-origen_5pt = os.path.join(ruta_base, "face_recognition_models", "models", "shape_predictor_5_face_landmarks.dat")
-destino_5pt = os.path.join(destino_dir, "shape_predictor_5_face_landmarks.dat")
+BASE = _base_dir()
 
-if not os.path.exists(destino_5pt):
+DB_PATH        = os.path.join(BASE, "reloj_control.db")
+ROSTROS_DIR    = os.path.join(BASE, "rostros")
+MODELOS_DIR    = os.path.join(BASE, "face_recognition_models", "models")
+SALIDAS_DIR    = os.path.join(BASE, "salidas_solicitudes")
+ASSETS_DIR     = os.path.join(BASE, "assets")
+
+os.makedirs(ROSTROS_DIR, exist_ok=True)
+os.makedirs(SALIDAS_DIR, exist_ok=True)
+
+# ================== LOG SENCILLO A ARCHIVO (junto al .exe) ==================
+LOG_PATH = os.path.join(BASE, "log_capturas.txt")
+def log(msg: str):
     try:
-        shutil.copy(origen_5pt, destino_5pt)
-    except:
+        with open(LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}\n")
+    except Exception:
         pass
 
-print(f"✅ Copiando modelo desde:\n  {origen_dat}\na:\n  {destino_dat}")
-if not os.path.exists(destino_dat):
-    shutil.copy(origen_dat, destino_dat)
+# Info de arranque (útil al empaquetar)
+print(f"[init] BASE={BASE}")
+print(f"[init] DB_PATH={DB_PATH}")
+print(f"[init] ROSTROS_DIR={ROSTROS_DIR}")
+log(f"Inicio app | BASE={BASE}")
 
-# ====================== HELPERS ======================
+# ============== MODELOS DLIB (copiamos a %TEMP% si hace falta) =============
+origen_dat = os.path.join(MODELOS_DIR, "shape_predictor_68_face_landmarks.dat")
+origen_5pt = os.path.join(MODELOS_DIR, "shape_predictor_5_face_landmarks.dat")
+destino_dir = os.path.join(os.environ.get("TEMP", ""), "face_recognition_models", "models")
+os.makedirs(destino_dir, exist_ok=True)
+destino_dat = os.path.join(destino_dir, "shape_predictor_68_face_landmarks.dat")
+destino_5pt = os.path.join(destino_dir, "shape_predictor_5_face_landmarks.dat")
+
+print(f"✅ Copiando modelo desde:\n  {origen_dat}\na:\n  {destino_dat}")
+try:
+    if os.path.exists(origen_dat) and not os.path.exists(destino_dat):
+        shutil.copy(origen_dat, destino_dat)
+    if os.path.exists(origen_5pt) and not os.path.exists(destino_5pt):
+        shutil.copy(origen_5pt, destino_5pt)
+except Exception as e:
+    print("Aviso: no se pudo copiar a TEMP:", e)
+    log(f"Aviso copia modelos: {e}")
+
+# ====================== HELPERS DE TIEMPO/BD ======================
 
 def parse_hora(hora_str):
     for fmt in ("%H:%M:%S", "%H:%M"):
@@ -56,9 +88,8 @@ def _dia_semana_es(fecha_iso: str) -> str:
     return dias[d.weekday()]
 
 def _get_flag_salida_anticipada_local():
-    """Lee bandera de salida anticipada del día (0/1, obs). No rompe si la tabla no existe."""
     try:
-        con = sqlite3.connect("reloj_control.db")
+        con = sqlite3.connect(DB_PATH)
         cur = con.cursor()
         cur.execute("""
             SELECT salida_anticipada, salida_anticipada_obs
@@ -69,16 +100,12 @@ def _get_flag_salida_anticipada_local():
         if not row:
             return (0, "")
         return (row[0] or 0, row[1] or "")
-    except Exception:
+    except Exception as e:
+        log(f"_get_flag_salida_anticipada_local error: {e}")
         return (0, "")
 
 def _hora_salida_oficial_por_horario(rut: str, fecha_iso: str, hora_ingreso_hhmm: str | None) -> str:
-    """
-    Calcula la hora de salida oficial (HH:MM) según 'horarios' para el día de 'fecha_iso'.
-    Usa el bloque que contiene la hora de ingreso. Soporta turnos nocturnos.
-    Si no encuentra bloque, usa la salida más tardía de ese día; si no hay, 17:30.
-    """
-    con = sqlite3.connect("reloj_control.db")
+    con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     dia = _dia_semana_es(fecha_iso)
     cur.execute("SELECT hora_entrada, hora_salida FROM horarios WHERE rut=? AND dia=?", (rut, dia))
@@ -105,30 +132,19 @@ def _hora_salida_oficial_por_horario(rut: str, fecha_iso: str, hora_ingreso_hhmm
     salidas_validas = [s for (_e, s) in turnos if s]
     return (max(salidas_validas)[:5] if salidas_validas else "17:30")
 
-# ======== EMERGENCIA: VALIDACIÓN POR RUT + CLAVE =========
-
+# ================== EMERGENCIA: VALIDACIÓN POR RUT + CLAVE ==================
 CLAVE_MAESTRA = "2202225"
 
 def _normalizar_rut(rut: str) -> str:
-    """Elimina puntos y espacios. Mantiene guion si existe."""
     return rut.replace(".", "").replace(" ", "").strip()
 
 def _clave_por_rut(rut: str) -> str:
-    """
-    Retorna los últimos 4 dígitos ANTES del guion del rut (sin puntos).
-    Ej: 12.345.678-9 -> '5678'
-    Si no hay guion, toma los últimos 4 del rut completo.
-    """
     limpio = _normalizar_rut(rut)
-    if "-" in limpio:
-        parte_num = limpio.split("-")[0]
-    else:
-        parte_num = limpio
+    parte_num = limpio.split("-")[0] if "-" in limpio else limpio
     solo_digitos = "".join(ch for ch in parte_num if ch.isdigit())
     return solo_digitos[-4:] if len(solo_digitos) >= 4 else solo_digitos
 
 def validar_pass_rut(rut: str, clave: str) -> bool:
-    """Acepta clave derivada del RUT o la CLAVE_MAESTRA."""
     if not rut or not clave:
         return False
     if clave == CLAVE_MAESTRA:
@@ -136,29 +152,22 @@ def validar_pass_rut(rut: str, clave: str) -> bool:
     return clave == _clave_por_rut(rut)
 
 # ================== VERIFICACIÓN FACIAL ==================
+FACIAL_TOLERANCE = 0.50      # más bajo = más estricto
+DISTANCE_MARGIN  = 0.04
+FRIDAY_FLEX_MINUTES = 30     # margen de “colación” (viernes): salida sin observación dentro de este rango
+LATE_AFTER_EXIT_MINUTES = 30 # Observación solo si la salida real supera (>=) este umbral
 
-# --------- PARÁMETROS DE RECONOCIMIENTO (ajustables) ----------
-FACIAL_TOLERANCE = 0.50      # antes típico ~0.60; más bajo = más estricto
-DISTANCE_MARGIN  = 0.04      # diferencia mínima entre 1º y 2º mejor match
+# ---------- NUEVO: configuración de extras ----------
+EXTRA_MINUTES_THRESHOLD = 30             # umbral para sumar a extras (minutos)
+EXTRA_COUNT_ONLY_ABOVE_THRESHOLD = True  # si True, solo suma si exceso >= umbral; si False, suma todos los minutos > 0
 
 def _ensure_list_encodings(obj):
-    """
-    Acepta tanto un solo encoding (np.array) como una lista de encodings.
-    Retorna siempre una lista [encoding, ...].
-    """
-    try:
-        import numpy as np  # noqa: F401 (solo para type-awareness)
-    except ImportError:
-        pass
     if isinstance(obj, (list, tuple)):
         return list(obj)
     return [obj]
 
 def _load_encodings_for_rut(rut: str):
-    """
-    Carga encodings de rostros/<rut>.pkl y los devuelve como lista.
-    """
-    archivo_rostro = os.path.join("rostros", f"{rut}.pkl")
+    archivo_rostro = os.path.join(ROSTROS_DIR, f"{rut}.pkl")
     if not os.path.exists(archivo_rostro):
         return []
     with open(archivo_rostro, "rb") as f:
@@ -166,102 +175,172 @@ def _load_encodings_for_rut(rut: str):
     return _ensure_list_encodings(data)
 
 def _load_all_known_encodings():
-    """
-    Carga TODOS los encodings de la carpeta rostros/.
-    Devuelve (encodings_list, rut_por_encoding_list).
-    Si un .pkl trae varios encodings, se agregan todos.
-    """
     encs, ruts = [], []
-    for archivo in os.listdir("rostros"):
-        if not archivo.endswith(".pkl"):
-            continue
-        rut = archivo[:-4]
-        for enc in _load_encodings_for_rut(rut):
-            encs.append(enc)
-            ruts.append(rut)
+    if not os.path.isdir(ROSTROS_DIR):
+        return encs, ruts
+    for archivo in os.listdir(ROSTROS_DIR):
+        if archivo.endswith(".pkl"):
+            rut = archivo[:-4]
+            for enc in _load_encodings_for_rut(rut):
+                encs.append(enc)
+                ruts.append(rut)
     return encs, ruts
 
+def _debug_listar_pkl():
+    try:
+        archivos = [a for a in os.listdir(ROSTROS_DIR) if a.endswith(".pkl")]
+        print(f"[enc] dir={ROSTROS_DIR} | archivos_pkl={len(archivos)}")
+    except Exception as e:
+        print(f"[enc] no se pudo listar pkl: {e}")
+
+# ------------------ Apertura robusta de cámara ------------------
+def _open_camera(max_index: int = 2):
+    try:
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_VFW, cv2.CAP_ANY]
+    except Exception:
+        backends = [cv2.CAP_ANY]
+
+    errores = []
+    for i in range(0, max_index + 1):
+        for be in backends:
+            try:
+                cap = cv2.VideoCapture(i, be)
+            except TypeError:
+                cap = cv2.VideoCapture(i)
+            if cap is not None and cap.isOpened():
+                print(f"[cam] OK index={i} backend={be}", flush=True)
+                try:
+                    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+                except Exception:
+                    pass
+                return cap, f"index={i}, backend={be}"
+            if cap is not None:
+                cap.release()
+            errores.append(f"falló index={i}, backend={be}")
+    detalle = "; ".join(errores) if errores else "no backends probados"
+    print("[cam] No se pudo abrir cámara:", detalle, flush=True)
+    log("No se pudo abrir cámara: " + detalle)
+    return None, detalle
+
+def _warmup_camera(cap, n=12):
+    for _ in range(n):
+        cap.read()
+        time.sleep(0.02)
+
 def verificar_rostro(rut):
-    """
-    Verifica un RUT específico: compara la cara capturada con las
-    muestras guardadas SOLO de esa persona. No fuerza coincidencias.
-    """
+    _debug_listar_pkl()
     expected_encs = _load_encodings_for_rut(rut)
+    print(f"[enc] para {rut}: {len(expected_encs)} encodings")
     if not expected_encs:
+        log(f"verificar_rostro: no hay encodings para {rut}")
         return False
 
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
+    cap, info = _open_camera()
+    if not cap:
+        log("verificar_rostro: cámara no abierta (" + info + ")")
         return False
 
+    print(f"[cam] iniciado verificación; encodings={len(expected_encs)}", flush=True)
+    _warmup_camera(cap, 12)
+
+    cv2.namedWindow("Verificación Facial", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Verificación Facial", 800, 600)
+
+    t0 = time.time()
+    duracion = 10.0  # segundos mínimos de captura
     verificado = False
     instrucciones_mostradas = False
 
-    for _ in range(60):
+    while time.time() - t0 < duracion:
         ret, frame = cap.read()
         if not ret:
+            time.sleep(0.02)
             continue
 
+        restante = max(0, int(duracion - (time.time() - t0)))
+        cv2.putText(frame, f"Tiempo restante: {restante}s", (40, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
         if not instrucciones_mostradas:
-            cv2.putText(frame, "Mire al frente sin moverse", (40, 40),
+            cv2.putText(frame, "Mire al frente sin moverse", (40, 70),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 255), 2)
             instrucciones_mostradas = True
 
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rostros = face_recognition.face_encodings(rgb)
+        try:
+            rostros = face_recognition.face_encodings(rgb)
+        except Exception as e:
+            print("Error en face_encodings:", e, flush=True)
+            log(f"face_encodings error: {e}")
+            break
 
         if rostros:
             if len(rostros) > 1:
-                cv2.putText(frame, "Por favor, solo 1 persona frente a la camara", (40, 80),
+                cv2.putText(frame, "Por favor, solo 1 persona frente a la camara", (40, 110),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
             cand = rostros[0]
             dists = face_recognition.face_distance(expected_encs, cand)
             best = float(min(dists)) if len(dists) else 1.0
             if best <= FACIAL_TOLERANCE:
                 verificado = True
-                break
 
-        cv2.imshow("Verificación Facial", cv2.resize(frame, (800, 600)))
-        if cv2.waitKey(1) & 0xFF == ord('q') or verificado:
+        cv2.imshow("Verificación Facial", frame)
+        if (cv2.waitKey(1) & 0xFF == ord('q')) or verificado:
             break
 
     cap.release()
     cv2.destroyAllWindows()
+    print(f"[cam] verificación fin -> {'OK' if verificado else 'FAIL'}", flush=True)
     return verificado
 
 def reconocer_rostro_sin_rut():
-    """
-    Reconocimiento abierto (sin RUT ingresado).
-    Selecciona el mejor candidato PERO solo lo acepta si:
-      - la distancia está bajo FACIAL_TOLERANCE, y
-      - existe margen suficiente vs el segundo mejor (DISTANCE_MARGIN).
-    Si no hay seguridad, retorna None (para caer al flujo de emergencia).
-    """
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        return None
-
+    _debug_listar_pkl()
     known_encs, rut_map = _load_all_known_encodings()
+    print(f"[enc] total encodings en carpeta: {len(known_encs)}")
     if not known_encs:
-        cap.release()
+        log("reconocer_rostro_sin_rut: no hay encodings en carpeta 'rostros'")
         return None
 
     import numpy as np
     known_matrix = np.vstack(known_encs)
 
+    cap, info = _open_camera()
+    if not cap:
+        log("reconocer_rostro_sin_rut: cámara no abierta (" + info + ")")
+        return None
+
+    print("[cam] iniciado reconocimiento abierto", flush=True)
+    _warmup_camera(cap, 12)
+
+    cv2.namedWindow("Reconocimiento Automático", cv2.WINDOW_NORMAL)
+    cv2.resizeWindow("Reconocimiento Automático", 800, 600)
+
+    t0 = time.time()
+    duracion = 10.0
     rostro_detectado = None
 
-    for _ in range(60):
+    while time.time() - t0 < duracion:
         ret, frame = cap.read()
         if not ret:
+            time.sleep(0.02)
             continue
 
+        restante = max(0, int(duracion - (time.time() - t0)))
+        cv2.putText(frame, f"Tiempo restante: {restante}s", (40, 30),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        rostros_en_vivo = face_recognition.face_encodings(rgb)
+        try:
+            rostros_en_vivo = face_recognition.face_encodings(rgb)
+        except Exception as e:
+            print("Error en face_encodings:", e, flush=True)
+            log(f"face_encodings error: {e}")
+            break
 
         if rostros_en_vivo:
             if len(rostros_en_vivo) > 1:
-                cv2.putText(frame, "Por favor, solo 1 persona frente a la camara", (40, 80),
+                cv2.putText(frame, "Por favor, solo 1 persona frente a la camara", (40, 70),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
             cand = rostros_en_vivo[0]
@@ -277,15 +356,14 @@ def reconocer_rostro_sin_rut():
 
             if seguro:
                 rostro_detectado = rut_map[best_idx]
-            else:
-                rostro_detectado = None  # explícitamente incierto
 
-        cv2.imshow("Reconocimiento Automático", cv2.resize(frame, (800, 600)))
-        if cv2.waitKey(1) & 0xFF == ord('q') or rostro_detectado:
+        cv2.imshow("Reconocimiento Automático", frame)
+        if (cv2.waitKey(1) & 0xFF == ord('q')) or rostro_detectado:
             break
 
     cap.release()
     cv2.destroyAllWindows()
+    print(f"[cam] reconocimiento fin -> {rostro_detectado}", flush=True)
     return rostro_detectado
 
 def verificar_rostro_async(rut, callback_exito, callback_error):
@@ -297,10 +375,11 @@ def verificar_rostro_async(rut, callback_exito, callback_error):
             else:
                 callback_error()
         except Exception as e:
+            log(f"Error en verificación: {e}")
             print("Error en verificación:", e)
             callback_error()
     import threading
-    threading.Thread(target=proceso).start()
+    threading.Thread(target=proceso, daemon=True).start()
 
 def reconocer_rostro_async(callback_exito, callback_error):
     def proceso():
@@ -311,13 +390,56 @@ def reconocer_rostro_async(callback_exito, callback_error):
             else:
                 callback_error()
         except Exception as e:
+            log(f"Error en reconocimiento: {e}")
             print("Error en reconocimiento:", e)
             callback_error()
     import threading
-    threading.Thread(target=proceso).start()
+    threading.Thread(target=proceso, daemon=True).start()
+
+# ============== EXTRAS MENSUALES (TABLA Y UTILIDADES) ==============
+def _extras_ensure_schema():
+    try:
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS extras_mensuales (
+                rut TEXT NOT NULL,
+                anio_mes TEXT NOT NULL,           -- 'YYYY-MM'
+                minutos_extra INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT,
+                PRIMARY KEY (rut, anio_mes)
+            )
+        """)
+        con.commit()
+        con.close()
+    except Exception as e:
+        log(f"extras schema error: {e}")
+
+def _extras_sumar_minutos(rut: str, fecha_iso: str, minutos: int):
+    """Suma 'minutos' al registro mensual (YYYY-MM). Si no existe, lo crea."""
+    try:
+        if minutos <= 0:
+            return
+        anio_mes = fecha_iso[:7]  # 'YYYY-MM'
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        con = sqlite3.connect(DB_PATH)
+        cur = con.cursor()
+        cur.execute("""
+            INSERT INTO extras_mensuales (rut, anio_mes, minutos_extra, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(rut, anio_mes) DO UPDATE SET
+                minutos_extra = minutos_extra + excluded.minutos_extra,
+                updated_at = excluded.updated_at
+        """, (rut, anio_mes, int(minutos), now))
+        con.commit()
+        con.close()
+    except Exception as e:
+        log(f"extras sumar error: {e}")
+
+# Crear esquema de extras al cargar el módulo
+_extras_ensure_schema()
 
 # ================== UI PRINCIPAL ==================
-
 def construir_ingreso_salida(frame_padre):
     # ---------- Diálogo de EMERGENCIA ----------
     def pedir_emergencia(rut_sugerido="", mensaje="❌ Rostro no verificado. Usa clave de emergencia:"):
@@ -335,7 +457,6 @@ def construir_ingreso_salida(frame_padre):
         cont = ctk.CTkFrame(win, corner_radius=12)
         cont.pack(fill="both", expand=True, padx=16, pady=16)
 
-        # Cabecera de alerta/ayuda
         alert_box = ctk.CTkFrame(cont, corner_radius=10, fg_color="#122b39")
         alert_box.pack(fill="x", pady=(0, 10))
         ctk.CTkLabel(
@@ -344,7 +465,6 @@ def construir_ingreso_salida(frame_padre):
             text_color="#6FE6FF", justify="left", wraplength=520
         ).pack(padx=10, pady=8, anchor="w")
 
-        # Campos
         form = ctk.CTkFrame(cont, fg_color="transparent")
         form.pack(fill="x", pady=(6, 8))
 
@@ -365,7 +485,6 @@ def construir_ingreso_salida(frame_padre):
             except Exception:
                 pass
 
-        # Pie de botones
         botones = ctk.CTkFrame(cont, fg_color="transparent")
         botones.pack(fill="x", pady=8)
 
@@ -375,12 +494,10 @@ def construir_ingreso_salida(frame_padre):
             if not rut_i or not pass_i:
                 tk.messagebox.showwarning("Campo vacío", "Debes ingresar RUT y clave.")
                 return
-
             if not validar_pass_rut(rut_i, pass_i):
                 tk.messagebox.showerror("Acceso denegado", "RUT o clave inválidos.")
                 return
 
-            # OK -> continúa flujo como si estuviera verificado
             try:
                 win.grab_release()
             except Exception:
@@ -393,10 +510,10 @@ def construir_ingreso_salida(frame_padre):
             label_hora_registro.configure(text="")
             cargar_info_usuario(rut_i, por_verificacion=True)
 
-        ctk.CTkButton(botones, text="Cancelar", fg_color="gray", command=lambda: win.destroy()).pack(side="left", padx=6)
+        ctk.CTkButton(botones, text="Cancelar", fg_color="gray",
+                      command=lambda: win.destroy()).pack(side="left", padx=6)
         ctk.CTkButton(botones, text="Validar", command=_confirmar).pack(side="right", padx=6)
 
-        # Posición y binds
         master.update_idletasks()
         w, h = 640, 250
         x = master.winfo_x() + (master.winfo_width() // 2) - (w // 2)
@@ -418,7 +535,7 @@ def construir_ingreso_salida(frame_padre):
         boton_salida.pack_forget()
 
     def actualizar_estado_botones(rut, por_reconocimiento=False):
-        conexion = sqlite3.connect("reloj_control.db")
+        conexion = sqlite3.connect(DB_PATH)
         cursor = conexion.cursor()
         cursor.execute("""
             SELECT hora_ingreso, hora_salida FROM registros
@@ -444,10 +561,7 @@ def construir_ingreso_salida(frame_padre):
 
         if not hora_salida:
             if por_reconocimiento:
-                label_estado.configure(
-                    text="✅ Verificación OK. Puedes registrar la salida.",
-                    text_color="yellow"
-                )
+                label_estado.configure(text="✅ Verificación OK. Puedes registrar la salida.", text_color="yellow")
                 boton_salida.pack(pady=10)
             else:
                 label_estado.configure(
@@ -462,6 +576,7 @@ def construir_ingreso_salida(frame_padre):
             text_color="green"
         )
 
+    # --------- función para registrar (ingreso/salida) ---------
     def registrar(tipo):
         rut = entry_rut.get().strip()
         nombre = label_nombre.cget("text").replace("Nombre: ", "")
@@ -469,11 +584,9 @@ def construir_ingreso_salida(frame_padre):
         hora_actual = datetime.now().strftime('%H:%M:%S')
         hora_actual_dt = parse_hora(hora_actual)
 
-        # ------- FERIADO -------
         es_f, nombre_f, _ = es_feriado(datetime.now().date())
         obs_feriado = f"Feriado: {nombre_f}" if es_f else ""
 
-        # Determinar día para bloques
         dia_actual = datetime.now().strftime('%A')
         dias_traducidos = {
             'Monday': 'Lunes', 'Tuesday': 'Martes', 'Wednesday': 'Miércoles',
@@ -481,16 +594,16 @@ def construir_ingreso_salida(frame_padre):
         }
         dia_semana = dias_traducidos.get(dia_actual, '')
 
-        conexion = sqlite3.connect("reloj_control.db")
+        conexion = sqlite3.connect(DB_PATH)
         cursor = conexion.cursor()
-
         cursor.execute("""
             SELECT hora_entrada, hora_salida FROM horarios
             WHERE rut = ? AND dia = ?
         """, (rut, dia_semana))
         bloques = cursor.fetchall()
 
-        def registrar_final(observacion=""):
+        # ---- REGISTRA EN BD (aplica panel/feriado/viernes-flex) ----
+        def registrar_final(observacion="", usar_hora_oficial_salida=False):
             if es_f:
                 observacion = (observacion + " | " if observacion else "") + obs_feriado
 
@@ -519,20 +632,18 @@ def construir_ingreso_salida(frame_padre):
                 conexion.close()
                 label_estado.configure(
                     text=("Ingreso registrado correctamente ✅\n"
-                          "Limpieza automática en 60 seg..." if not es_f else
+                          "Limpieza automática en 5 seg..." if not es_f else
                           f"Ingreso en feriado registrado ✅ ({nombre_f}).\nLimpieza automática en 60 seg..."),
                     text_color="green"
                 )
-
                 boton_ingreso.pack_forget()
                 boton_salida.pack_forget()
                 actualizar_estado_botones(rut, por_reconocimiento=False)
-                # Mostrar hora grande DESPUÉS de actualizar estado
                 label_hora_registro.configure(text=f"⏰ Hora de registro: {hora_actual}", text_color="yellow")
-                frame.after(60000, limpiar_campos)
+                frame.after(5000 if not es_f else 60000, limpiar_campos)
 
             elif tipo == "salida":
-                # Caso: salida anticipada autorizada por panel
+                # Panel de salida anticipada (guarda hora oficial) → NO suma extras
                 flag, obs_aut = _get_flag_salida_anticipada_local()
                 if flag and not es_f:
                     cursor.execute("""
@@ -544,13 +655,15 @@ def construir_ingreso_salida(frame_padre):
                     hora_oficial = _hora_salida_oficial_por_horario(rut, fecha_iso, hora_ingreso_hhmm)
                     obs_concat = (row[1] + " | " if row and row[1] else "") + (obs_aut or "Salida anticipada autorizada")
 
+                    # Doble-check salida ya registrada
+                    cursor.execute("SELECT hora_salida FROM registros WHERE rut=? AND DATE(fecha)=DATE('now')", (rut,))
+                    hs = cursor.fetchone()
+                    if hs and hs[0]:
+                        label_estado.configure(text="⚠️ Ya registraste una salida hoy.", text_color="orange")
+                        conexion.close()
+                        return
+
                     if row:
-                        cursor.execute("SELECT hora_salida FROM registros WHERE rut=? AND DATE(fecha)=DATE('now')", (rut,))
-                        hs = cursor.fetchone()
-                        if hs and hs[0]:
-                            label_estado.configure(text="⚠️ Ya registraste una salida hoy.", text_color="orange")
-                            conexion.close()
-                            return
                         cursor.execute("""
                             UPDATE registros SET hora_salida=?, observacion=? 
                             WHERE rut=? AND DATE(fecha)=DATE('now')
@@ -563,20 +676,19 @@ def construir_ingreso_salida(frame_padre):
                     conexion.commit()
                     conexion.close()
 
+                    # No sumar extras (se guardó hora oficial)
                     label_estado.configure(
-                        text=f"Salida anticipada registrada ✅ (hora oficial {hora_oficial}).\nLimpieza automática en 60 seg...",
+                        text=f"Salida anticipada registrada ✅ (hora oficial {hora_oficial}).\nLimpieza automática en 5 seg...",
                         text_color="green"
                     )
-
                     boton_ingreso.pack_forget()
                     boton_salida.pack_forget()
                     actualizar_estado_botones(rut, por_reconocimiento=False)
-                    # Hora grande del registro realizado ahora
                     label_hora_registro.configure(text=f"⏰ Hora de registro: {hora_actual}", text_color="yellow")
-                    frame.after(60000, limpiar_campos)
+                    frame.after(5000, limpiar_campos)
                     return
 
-                # Salida normal (sin flag)
+                # Flujo normal (sin panel)
                 cursor.execute("""
                     SELECT hora_salida FROM registros WHERE rut = ? AND DATE(fecha) = DATE('now')
                 """, (rut,))
@@ -586,35 +698,87 @@ def construir_ingreso_salida(frame_padre):
                     conexion.close()
                     return
 
+                # ¿Usar hora oficial (regla viernes) o hora actual?
+                hora_db = hora_actual
+                hora_oficial_usada = None
+                if usar_hora_oficial_salida:
+                    cursor.execute("""
+                        SELECT hora_ingreso, observacion FROM registros 
+                        WHERE rut=? AND DATE(fecha)=DATE('now')
+                    """, (rut,))
+                    row = cursor.fetchone()
+                    hora_ingreso_hhmm = row[0] if row else None
+                    hora_oficial = _hora_salida_oficial_por_horario(rut, fecha_iso, hora_ingreso_hhmm)
+                    hora_db = f"{hora_oficial}:00" if len(hora_oficial) == 5 else hora_oficial
+                    hora_oficial_usada = hora_oficial
+
+                # Guardar salida
                 if resultado:
                     cursor.execute("""
                         UPDATE registros SET hora_salida = ?, observacion = ? 
                         WHERE rut = ? AND DATE(fecha) = DATE('now')
-                    """, (hora_actual, observacion, rut))
+                    """, (hora_db, observacion, rut))
                     conexion.commit()
                 else:
                     cursor.execute("""
                         INSERT INTO registros (rut, nombre, fecha, hora_ingreso, hora_salida, observacion)
                         VALUES (?, ?, ?, ?, ?, ?)
-                    """, (rut, nombre, fecha_iso, None, hora_actual, observacion))
+                    """, (rut, nombre, fecha_iso, None, hora_db, observacion))
                     conexion.commit()
-
                 conexion.close()
-                label_estado.configure(
-                    text=("Salida registrada correctamente ✅\n"
-                          "Limpieza automática en 60 seg..." if not es_f else
-                          f"Salida en feriado registrada ✅ ({nombre_f}).\nLimpieza automática en 60 seg..."),
-                    text_color="green"
-                )
+
+                # ---- NUEVO: sumar minutos extra del mes si corresponde ----
+                # No se suma si se usó hora oficial (viernes colación) o panel de salida.
+                if not usar_hora_oficial_salida:
+                    try:
+                        # obtener hora ingreso para resolver bloque correcto
+                        con2 = sqlite3.connect(DB_PATH)
+                        cur2 = con2.cursor()
+                        cur2.execute("SELECT hora_ingreso FROM registros WHERE rut=? AND DATE(fecha)=DATE('now')", (rut,))
+                        row = cur2.fetchone()
+                        con2.close()
+                        hora_ingreso_hhmm = row[0] if row and row[0] else None
+                        hora_oficial_str = _hora_salida_oficial_por_horario(rut, fecha_iso, hora_ingreso_hhmm)
+                        # Calcular delta (minutos) solo si hay hora oficial válida
+                        if hora_oficial_str:
+                            base = datetime.now().date()
+                            t_act = datetime.combine(base, hora_actual_dt.time())
+                            t_ofi_time = parse_hora(hora_oficial_str)
+                            t_ofi = datetime.combine(base, t_ofi_time.time())
+                            # Nota: si el turno es nocturno, este cálculo puede no aplicar. Casos estándar: mismo día.
+                            exceso_min = int(max(0, (t_act - t_ofi).total_seconds() // 60))
+                            if EXTRA_COUNT_ONLY_ABOVE_THRESHOLD:
+                                exceso_contable = exceso_min if exceso_min >= EXTRA_MINUTES_THRESHOLD else 0
+                            else:
+                                exceso_contable = exceso_min
+                            if exceso_contable > 0:
+                                _extras_sumar_minutos(rut, fecha_iso, exceso_contable)
+                    except Exception as e:
+                        log(f"calc extras error: {e}")
+
+                # Mensajes finales
+                if usar_hora_oficial_salida and hora_oficial_usada:
+                    label_estado.configure(
+                        text=(f"Salida de viernes (colación) registrada ✅\n"
+                              f"Se guarda la hora oficial {hora_oficial_usada}.\n"
+                              f"Limpieza automática en 5 seg..."),
+                        text_color="green"
+                    )
+                else:
+                    label_estado.configure(
+                        text=("Salida registrada correctamente ✅\n"
+                              "Limpieza automática en 5 seg..." if not es_f else
+                              f"Salida en feriado registrada ✅ ({nombre_f}).\nLimpieza automática en 60 seg..."),
+                        text_color="green"
+                    )
 
                 boton_ingreso.pack_forget()
                 boton_salida.pack_forget()
                 actualizar_estado_botones(rut, por_reconocimiento=False)
-                # Hora grande también en salida normal
                 label_hora_registro.configure(text=f"⏰ Hora de registro: {hora_actual}", text_color="yellow")
-                frame.after(60000, limpiar_campos)
+                frame.after(5000 if not es_f else 60000, limpiar_campos)
 
-        # ---------- Reglas para pedir observación (NO en feriado) ----------
+        # ---------- Reglas para pedir observación ----------
         if es_f:
             registrar_final("")
             return
@@ -623,6 +787,7 @@ def construir_ingreso_salida(frame_padre):
         mensaje_motivo = ""
 
         if tipo == "ingreso":
+            # Observación sólo si llegas con atraso (> 5 min)
             for hora_entrada, _ in bloques:
                 if not hora_entrada:
                     continue
@@ -653,21 +818,38 @@ def construir_ingreso_salida(frame_padre):
                         ultima_salida_str = max(bloques_validos, key=lambda h: parse_hora(h))
                         ultima_salida_dt = parse_hora(ultima_salida_str)
 
-                        if hora_actual_dt >= ultima_salida_dt:
+                        # --- Regla de viernes (colación) ---
+                        if dia_semana == 'Viernes':
+                            margen = timedelta(minutes=FRIDAY_FLEX_MINUTES)
+                            if ultima_salida_dt - margen <= hora_actual_dt < ultima_salida_dt:
+                                registrar_final("", usar_hora_oficial_salida=True)
+                                return
+                        # ------------------------------------
+
+                        if hora_actual_dt < ultima_salida_dt:
+                            # Salida antes de la pactada → sin observación (y no suma extras)
                             registrar_final()
                             return
                         else:
-                            delta = (ultima_salida_dt - hora_actual_dt).total_seconds()
-                            horas = int(delta // 3600)
-                            minutos = int((delta % 3600) // 60)
-                            mensaje_motivo = (
-                                f"⚠️ ¡Atención! Estás registrando una salida antes del horario establecido.\n"
-                                f"ℹ️ Hora de salida asignada: {ultima_salida_dt.strftime('%H:%M')}.\n"
-                                f"🕒 Hora actual: {hora_actual_dt.strftime('%H:%M')}.\n"
-                                f"⏳ Diferencia: {int(delta // 60)} minutos ({horas:02}:{minutos:02}).\n"
-                                f"✍️ Por favor, indica el motivo:"
-                            )
-                            requiere_observacion = True
+                            # Salida después de pactada: observación sólo si excede el umbral
+                            delta_seg = (hora_actual_dt - ultima_salida_dt).total_seconds()
+                            delta_min = int(delta_seg // 60)
+                            if delta_min >= LATE_AFTER_EXIT_MINUTES:
+                                horas = int(delta_min // 60)
+                                minutos = int(delta_min % 60)
+                                mensaje_motivo = (
+                                    f"⚠️ Estás registrando salida {delta_min} minuto(s) "
+                                    f"después de la hora pactada ({ultima_salida_dt.strftime('%H:%M')}).\n"
+                                    f"🕒 Hora actual: {hora_actual_dt.strftime('%H:%M')}.\n"
+                                    f"⏱ Exceso: {horas:02}:{minutos:02}.\n"
+                                    f"✍️ Por favor, indica el motivo:"
+                                )
+                                requiere_observacion = True
+                            else:
+                                # Dentro del umbral → registro directo (sí suma extras si config lo permite)
+                                registrar_final()
+                                return
+
                     except Exception:
                         mensaje_motivo = (
                             f"⚠️ ¡Atención! No se pudo determinar la hora de salida esperada.\n"
@@ -676,8 +858,8 @@ def construir_ingreso_salida(frame_padre):
                         )
                         requiere_observacion = True
 
-        # --- Diálogo de observación (solo si se requiere y NO feriado) ---
-        def pedir_observacion(motivo):
+        if requiere_observacion:
+            # Diálogo para anotar motivo
             TopLevelCls = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
             master = frame.winfo_toplevel()
             win = TopLevelCls(master)
@@ -692,64 +874,24 @@ def construir_ingreso_salida(frame_padre):
             cont = ctk.CTkFrame(win, corner_radius=12)
             cont.pack(fill="both", expand=True, padx=16, pady=16)
 
-            # --------- Cabecera (alerta) + detalle alineado en 2 columnas ----------
-            lines = [l for l in motivo.split("\n") if l.strip()]
-            alert_line = ""
-            body_lines = []
-
-            if lines and (lines[0].startswith("⚠️") or "¡Atención" in lines[0]):
-                alert_line = lines[0]
-                body_lines = lines[1:]
-            else:
-                body_lines = lines
-
-            if alert_line:
-                alert_box = ctk.CTkFrame(cont, corner_radius=10, fg_color="#3a2e00")
-                alert_box.pack(fill="x", pady=(0, 8))
-                ctk.CTkLabel(
-                    alert_box, text=alert_line, font=("Arial", 14, "bold"),
-                    text_color="#FFC857", justify="left", wraplength=560
-                ).pack(padx=10, pady=8, anchor="w")
-
-            ICONS = {"ℹ️", "🕒", "⏳", "✍️", "⏱"}
-
-            def split_icon(line: str):
-                parts = line.split(" ", 1)
-                if len(parts) == 2 and parts[0] in ICONS:
-                    return parts[0], parts[1]
-                return "•", line
-
-            rows = ctk.CTkFrame(cont, fg_color="transparent")
-            rows.pack(fill="x", pady=(0, 10))
-
-            for l in body_lines:
-                icon, text = split_icon(l)
-                row = ctk.CTkFrame(rows, fg_color="transparent")
-                row.pack(fill="x", pady=1)
-
-                ctk.CTkLabel(row, text=icon, width=28, font=("Arial", 14), anchor="center")\
-                    .grid(row=0, column=0, sticky="nw", padx=(4, 6))
-
-                ctk.CTkLabel(row, text=text, font=("Arial", 13), justify="left", wraplength=560)\
-                    .grid(row=0, column=1, sticky="w")
-                row.grid_columnconfigure(1, weight=1)
+            # Encabezado
+            alert_box = ctk.CTkFrame(cont, corner_radius=10, fg_color="#3a2e00")
+            alert_box.pack(fill="x", pady=(0, 8))
+            ctk.CTkLabel(
+                alert_box, text=mensaje_motivo, font=("Arial", 13),
+                text_color="#FFC857", justify="left", wraplength=560
+            ).pack(padx=10, pady=8, anchor="w")
 
             Textbox = getattr(ctk, "CTkTextbox", None)
             if Textbox:
                 entry_obs = Textbox(cont, width=560, height=130)
                 entry_obs.pack(fill="both", expand=False)
                 def get_text(): return entry_obs.get("1.0", "end").strip()
-                def focus_text():
-                    try: entry_obs.focus_set()
-                    except Exception: pass
             else:
                 wrap = tk.Frame(cont); wrap.pack(fill="both", expand=False)
                 entry_obs = tk.Text(wrap, width=68, height=6, font=("Segoe UI", 11))
                 entry_obs.pack(fill="both", expand=False)
                 def get_text(): return entry_obs.get("1.0", "end").strip()
-                def focus_text():
-                    try: entry_obs.focus_set()
-                    except Exception: pass
 
             counter = ctk.CTkLabel(cont, text="0/200 caracteres", text_color="gray")
             counter.pack(anchor="e", pady=(4, 0))
@@ -760,8 +902,10 @@ def construir_ingreso_salida(frame_padre):
                     entry_obs.delete("1.0", "end"); entry_obs.insert("1.0", txt[:200])
                     txt = txt[:200]
                 counter.configure(text=f"{len(txt)}/200 caracteres")
-
-            entry_obs.bind("<KeyRelease>", actualizar_contador)
+            try:
+                entry_obs.bind("<KeyRelease>", actualizar_contador)
+            except Exception:
+                pass
 
             botones = ctk.CTkFrame(cont, fg_color="transparent")
             botones.pack(fill="x", pady=12)
@@ -787,7 +931,6 @@ def construir_ingreso_salida(frame_padre):
             y = master.winfo_y() + (master.winfo_height() // 2) - (h // 2)
             win.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
             try:
-                win.minsize(680, 480)
                 win.lift()
                 win.attributes("-topmost", True)
                 win.after(50, lambda: win.attributes("-topmost", False))
@@ -796,16 +939,13 @@ def construir_ingreso_salida(frame_padre):
 
             win.bind("<Return>", lambda e: confirmar())
             win.bind("<Escape>", lambda e: win.destroy())
-            win.after(80, focus_text)
             actualizar_contador()
 
-        if requiere_observacion:
-            pedir_observacion(mensaje_motivo)
         else:
             registrar_final()
 
     def cargar_info_usuario(rut, por_verificacion=False):
-        conexion = sqlite3.connect("reloj_control.db")
+        conexion = sqlite3.connect(DB_PATH)
         cursor = conexion.cursor()
         cursor.execute("SELECT nombre, apellido, profesion, cumpleanos FROM trabajadores WHERE rut = ?", (rut,))
         resultado = cursor.fetchone()
@@ -823,7 +963,6 @@ def construir_ingreso_salida(frame_padre):
             if cumpleanos and hoy == cumpleanos[:5]:
                 label_estado.configure(text=f"🎂 ¡Hoy es el cumpleaños de {resultado[0]}! 🎉", text_color="yellow")
             else:
-                # Al cargar info para una búsqueda nueva, limpia la hora grande previa
                 label_hora_registro.configure(text="")
                 actualizar_estado_botones(rut, por_reconocimiento=por_verificacion)
 
@@ -843,21 +982,6 @@ def construir_ingreso_salida(frame_padre):
             boton_salida.pack_forget()
         conexion.close()
 
-    def buscar_rut():
-        rut = entry_rut.get().strip()
-        if not rut:
-            label_estado.configure(text="Ingresa un RUT válido", text_color="red")
-            label_hora_registro.configure(text="")
-            return
-        label_estado.configure(text="🔄 Verificando rostro...", text_color="gray")
-        label_hora_registro.configure(text="")  # limpia posible hora previa
-        frame.update()
-        verificar_rostro_async(
-            rut,
-            callback_exito=lambda: cargar_info_usuario(rut, por_verificacion=True),
-            callback_error=lambda: pedir_emergencia(rut_sugerido=rut)
-        )
-
     def buscar_automatico():
         rut = entry_rut.get().strip()
         if not rut:
@@ -872,13 +996,18 @@ def construir_ingreso_salida(frame_padre):
                 callback_error=lambda: pedir_emergencia(rut_sugerido="", mensaje="❌ No se pudo identificar el rostro. Usa clave de emergencia:")
             )
             return
-        # Si el usuario ya puso RUT, intentamos con rostro; si falla, emergencia:
+
         label_estado.configure(text="🔄 Verificando rostro...", text_color="gray")
+        label_hora_registro.configure(text="")
+        frame.update()
         verificar_rostro_async(
             rut,
             callback_exito=lambda: cargar_info_usuario(rut, por_verificacion=True),
             callback_error=lambda: pedir_emergencia(rut_sugerido=rut)
         )
+
+    def limpiar_campos_btn():
+        limpiar_campos()
 
     # ---------- UI ----------
     frame = ctk.CTkFrame(frame_padre)
@@ -891,29 +1020,16 @@ def construir_ingreso_salida(frame_padre):
     entry_rut.bind("<Return>", lambda event: buscar_automatico())
 
     ctk.CTkButton(frame, text="Buscar", command=buscar_automatico).pack(pady=5)
-    ctk.CTkButton(frame, text="Limpiar", command=limpiar_campos).pack(pady=5)
+    ctk.CTkButton(frame, text="Limpiar", command=limpiar_campos_btn).pack(pady=5)
 
-    label_nombre = ctk.CTkLabel(frame, text="Nombre: ---", font=("Arial", 14))
-    label_nombre.pack(pady=(15, 5))
-    label_profesion = ctk.CTkLabel(frame, text="Profesión: ---", font=("Arial", 14))
-    label_profesion.pack(pady=5)
-    label_fecha = ctk.CTkLabel(frame, text="Fecha: ---", font=("Arial", 14))
-    label_fecha.pack(pady=5)
-    label_hora = ctk.CTkLabel(frame, text="Hora: ---", font=("Arial", 14))
-    label_hora.pack(pady=5)
+    label_nombre = ctk.CTkLabel(frame, text="Nombre: ---", font=("Arial", 14)); label_nombre.pack(pady=(15, 5))
+    label_profesion = ctk.CTkLabel(frame, text="Profesión: ---", font=("Arial", 14)); label_profesion.pack(pady=5)
+    label_fecha = ctk.CTkLabel(frame, text="Fecha: ---", font=("Arial", 14)); label_fecha.pack(pady=5)
+    label_hora = ctk.CTkLabel(frame, text="Hora: ---", font=("Arial", 14)); label_hora.pack(pady=5)
 
     boton_ingreso = ctk.CTkButton(frame, text="Registrar Ingreso", font=("Arial", 15), height=45, width=220)
     boton_salida  = ctk.CTkButton(frame, text="Registrar Salida",  font=("Arial", 15), height=45, width=220)
 
-    # Mensaje más grande (+2)
-    label_estado = ctk.CTkLabel(frame, text="", font=("Arial", 16))
-    label_estado.pack(pady=10)
-
-    # Hora grande separada
-    label_hora_registro = ctk.CTkLabel(
-        frame,
-        text="",
-        font=("Arial", 36, "bold"),
-        text_color="yellow"
-    )
+    label_estado = ctk.CTkLabel(frame, text="", font=("Arial", 16)); label_estado.pack(pady=10)
+    label_hora_registro = ctk.CTkLabel(frame, text="", font=("Arial", 36, "bold"), text_color="yellow")
     label_hora_registro.pack(pady=(25, 35))

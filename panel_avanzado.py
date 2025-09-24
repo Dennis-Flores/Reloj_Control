@@ -542,28 +542,37 @@ def _abrir_gestor_feriados(parent):
     _center_on_parent(win, parent)
     _lift_and_focus(win, parent)
 
-# --- IMPORTAR SIEMPRE DESDE DISCO (sin caché) ---
-def _import_fresh(mod_name: str):
-    base = _app_path()
-    path = os.path.join(base, f"{mod_name}.py")
-    if not os.path.exists(path):
-        raise FileNotFoundError(f"No se encontró {mod_name}.py en: {path}")
-    importlib.invalidate_caches()
-    if mod_name in sys.modules:
-        del sys.modules[mod_name]
-    spec = importlib.util.spec_from_file_location(mod_name, path)
-    if not spec or not spec.loader:
-        raise ImportError(f"No se pudo crear spec para {path}")
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    sys.modules[mod_name] = mod
-    return mod
+# --- Import robusto (packaged + dev) ---
+def _load_runtime_module(mod_name: str):
+    """
+    1) Intenta import normal (sirve en el .exe si se agregó --hidden-import).
+    2) Si falla, carga el archivo .py desde la carpeta junto al .py/.exe (modo dev).
+    """
+    # 1) paquete / .exe
+    try:
+        return importlib.import_module(mod_name)
+    except Exception as e_primary:
+        # 2) fallback a .py en disco (desarrollo)
+        base = _app_path()
+        path = os.path.join(base, f"{mod_name}.py")
+        try:
+            if not os.path.exists(path):
+                raise FileNotFoundError(path)
+            spec = importlib.util.spec_from_file_location(mod_name, path)
+            if not spec or not spec.loader:
+                raise ImportError(f"spec inválido para {path}")
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[attr-defined]
+            return mod
+        except Exception as e_fallback:
+            raise ImportError(f"No se pudo importar '{mod_name}'. "
+                              f"Primario: {e_primary} | Fallback: {e_fallback}")
 
-# --- Abridores (usan import "fresh") ---
+# --- Abridores (usan import robusto) ---
 def _abrir_asistencia_general(frame_padre):
     app_root = frame_padre.winfo_toplevel()
     try:
-        mod = _import_fresh("asistencia_funcionarios")
+        mod = _load_runtime_module("asistencia_funcionarios")
         if not hasattr(mod, "abrir_asistencia"):
             raise AttributeError("El módulo 'asistencia_funcionarios' no define 'abrir_asistencia(app_root, db_path)'.")
         mod.abrir_asistencia(app_root, DB_PATH)
@@ -573,7 +582,7 @@ def _abrir_asistencia_general(frame_padre):
 def _abrir_asistencia_diaria(frame_padre):
     app_root = frame_padre.winfo_toplevel()
     try:
-        mod = _import_fresh("asistencia_diaria")
+        mod = _load_runtime_module("asistencia_diaria")
         if not hasattr(mod, "abrir_asistencia_diaria"):
             raise AttributeError("El módulo 'asistencia_diaria' no define 'abrir_asistencia_diaria(app_root, db_path)'.")
         mod.abrir_asistencia_diaria(app_root, DB_PATH)

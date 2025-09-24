@@ -32,7 +32,7 @@ AJUSTE_COLACION_FIJO_43_44 = True
 MINUTOS_AJUSTE_FIJO = 150
 TOLERANCIA_MIN = 5  # tolerancia
 
-# ========= Fallback SMTP (igual a tu ejemplo de asistencia_diaria) =========
+# ========= Fallback SMTP =========
 SMTP_FALLBACK = {
     "host": "mail.bioaccess.cl",
     "port": 465,  # SSL directo
@@ -46,7 +46,6 @@ SMTP_FALLBACK = {
 # ===================== Helpers de hora =====================
 
 def parse_hora_flexible(hora_str):
-    """Devuelve un datetime (solo tiempo) para HH:MM o HH:MM:SS."""
     if not hora_str:
         return None
     for fmt in ("%H:%M:%S", "%H:%M"):
@@ -67,7 +66,6 @@ def _ph_any(s):
     return None
 
 def obtener_horario_del_dia(rut, fecha_dt):
-    """Devuelve (hora_entrada, hora_salida) pactadas para ese día (strings HH:MM[:SS])."""
     if isinstance(fecha_dt, str):
         fecha_dt = datetime.strptime(fecha_dt, "%Y-%m-%d")
 
@@ -97,9 +95,7 @@ def obtener_horario_del_dia(rut, fecha_dt):
 # ===================== Datos del trabajador =====================
 
 def get_info_trabajador(conn, rut):
-    """Devuelve (nombre, apellido, profesion, correo?) para el RUT."""
     cur = conn.cursor()
-    # intentar traer correo si existe la columna
     try:
         cur.execute("PRAGMA table_info(trabajadores)")
         cols = {c[1].lower() for c in cur.fetchall()}
@@ -121,18 +117,12 @@ def get_info_trabajador(conn, rut):
     if not row:
         return None
     if "correo" in cols:
-        return row  # (nombre, apellido, profesion, correo)
+        return row
     return (row[0], row[1], row[2], None)
 
 # ===================== Carga Horaria (semanal) =====================
 
 def calcular_carga_horaria_semana(rut):
-    """
-    Suma total de minutos de la semana según 'horarios' (salida - entrada).
-    Ajuste 43h/44h (+150min) si:
-      - total == 40:30 (2430) o 41:30 (2490), y
-      - hay >= 4 días con 2+ bloques (colación fuera).
-    """
     con = sqlite3.connect("reloj_control.db")
     cur = con.cursor()
     cur.execute("""
@@ -174,11 +164,6 @@ def calcular_carga_horaria_semana(rut):
 # ===================== Utilidades BD / SMTP =====================
 
 def obtener_cupo_admin_para_rut(rut):
-    """
-    Lee cupo anual de días administrativos desde:
-    tabla: parametros_trabajador(rut TEXT, clave TEXT, valor TEXT)
-    clave = 'dias_admin_cupo'
-    """
     try:
         con = sqlite3.connect("reloj_control.db")
         cur = con.cursor()
@@ -194,18 +179,118 @@ def obtener_cupo_admin_para_rut(rut):
         pass
     return None
 
+# === NUEVO: contador anual de días administrativos (reinicia cada año) ===
+def contar_admin_anio(rut: str, anio: int | None = None) -> int:
+    try:
+        if anio is None:
+            anio = datetime.now().year
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        # Ajusta a LIKE si tus motivos no son exactos:
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM dias_libres
+            WHERE rut=? AND strftime('%Y', fecha)=?
+              AND motivo = 'Día Administrativo'
+        """, (rut, str(anio)))
+        n = cur.fetchone()[0] or 0
+        con.close()
+        return int(n)
+    except Exception:
+        return 0
+
+# ===================== Extras mensuales (nueva tabla) =====================
+
+def _detectar_tabla_extras(conn):
+    cur = conn.cursor()
+    try:
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tablas = [r[0] for r in cur.fetchall()]
+    except Exception:
+        return None
+
+    candidatos = [
+        "extras_mensuales", "extras_mensual", "minutos_extra_mensual",
+        "minutos_extras_mensuales", "saldo_extras_mensual", "acumulado_extras_mensual"
+    ]
+    for t in tablas:
+        if t.lower() in candidatos:
+            try:
+                cur.execute(f"PRAGMA table_info({t})")
+                cols = {c[1].lower() for c in cur.fetchall()}
+            except Exception:
+                cols = set()
+            col_min = next((c for c in ["minutos_extra","minutos","min_extras","minutos_extras","total_minutos"] if c in cols), None)
+            col_anio = "anio" if "anio" in cols else ("year" if "year" in cols else None)
+            col_mes  = "mes"  if "mes"  in cols else ("month" if "month" in cols else None)
+            if col_min and col_anio and col_mes and "rut" in cols:
+                return {"tabla": t, "col_min": col_min, "col_anio": col_anio, "col_mes": col_mes}
+    for t in tablas:
+        try:
+            cur.execute(f"PRAGMA table_info({t})")
+            cols = {c[1].lower() for c in cur.fetchall()}
+        except Exception:
+            continue
+        if "rut" in cols and (("anio" in cols) or ("year" in cols)) and (("mes" in cols) or ("month" in cols)):
+            col_min = next((c for c in ["minutos_extra","minutos","min_extras","minutos_extras","total_minutos"] if c in cols), None)
+            if col_min:
+                return {
+                    "tabla": t,
+                    "col_min": col_min,
+                    "col_anio": "anio" if "anio" in cols else "year",
+                    "col_mes":  "mes"  if "mes"  in cols else "month"
+                }
+    return None
+
+def leer_minutos_extra_mes(rut, anio, mes):
+    try:
+        con = sqlite3.connect("reloj_control.db")
+        meta = _detectar_tabla_extras(con)
+        if not meta:
+            con.close()
+            return None
+        t, cmin, canio, cmes = meta["tabla"], meta["col_min"], meta["col_anio"], meta["col_mes"]
+        cur = con.cursor()
+        cur.execute(f"SELECT {cmin} FROM {t} WHERE rut=? AND {canio}=? AND {cmes}=?", (rut, int(anio), int(mes)))
+        row = cur.fetchone()
+        con.close()
+        if row and row[0] is not None:
+            try:
+                return int(row[0])
+            except Exception:
+                val = str(row[0])
+                if ":" in val:
+                    hh, mm = val.split(":")
+                    return int(hh) * 60 + int(mm)
+        return None
+    except Exception:
+        return None
+
+# === NUEVO: acumulado anual de extras (reinicia cada año) ===
+def sumar_minutos_extras_anio(rut, anio):
+    total = 0
+    for m in range(1, 13):
+        mins = leer_minutos_extra_mes(rut, anio, m)
+        if mins:
+            total += int(mins)
+    return total
+
+# === NUEVO: acumulado YTD hasta un mes dado (para tabla diaria) ===
+def sumar_minutos_extras_hasta_mes(rut, anio, mes):
+    total = 0
+    for m in range(1, mes+1):
+        mins = leer_minutos_extra_mes(rut, anio, m)
+        if mins:
+            total += int(mins)
+    return total
+
+# ===================== Email (HTML simple) =====================
+
 def _smtp_load_config():
-    """
-    Carga configuración SMTP desde BD.
-    Busca tabla 'smtp_config' (host, port, user, password, use_tls, use_ssl, remitente)
-    o 'parametros_smtp' con pares clave/valor.
-    Retorna dict o None si no hay configuración.
-    """
     cfg = {}
     try:
         con = sqlite3.connect("reloj_control.db")
         cur = con.cursor()
-        # Opción 1: smtp_config
         try:
             cur.execute("SELECT host, port, user, password, use_tls, use_ssl, remitente FROM smtp_config LIMIT 1")
             row = cur.fetchone()
@@ -223,8 +308,6 @@ def _smtp_load_config():
                 return cfg
         except Exception:
             pass
-
-        # Opción 2: parametros_smtp (clave/valor)
         try:
             cur.execute("SELECT clave, valor FROM parametros_smtp")
             rows = cur.fetchall()
@@ -243,16 +326,12 @@ def _smtp_load_config():
                 return cfg
         except Exception:
             pass
-
         con.close()
     except Exception:
         pass
     return None
 
 def _smtp_send(to_list, cc_list, subject, body_text, html_body, attachment_path=None):
-    """
-    Envía correo. Intenta con configuración en BD; si no hay, usa fallback BioAccess.
-    """
     cfg = _smtp_load_config() or SMTP_FALLBACK
 
     msg = EmailMessage()
@@ -303,8 +382,6 @@ def _smtp_send(to_list, cc_list, subject, body_text, html_body, attachment_path=
             if user and password:
                 server.login(user, password)
             server.send_message(msg)
-
-# ===================== Email (HTML simple) =====================
 
 def _html_email_informe(periodo: str, identidad: str):
     gen = datetime.now().strftime("%d-%m-%Y %H:%M")
@@ -365,7 +442,6 @@ def construir_reportes(frame_padre):
 
     # -------- horas pactadas por día administrativo --------
     def obtener_horas_administrativo(rut, fecha_str_o_dt, como_minutos=False):
-        """Suma de (salida-entrada) en horarios pactados del día de la semana; normaliza tildes."""
         try:
             if isinstance(fecha_str_o_dt, str):
                 fecha_dt = datetime.strptime(fecha_str_o_dt, "%Y-%m-%d")
@@ -415,7 +491,6 @@ def construir_reportes(frame_padre):
 
     # -------- mezcla administrativos --------
     def agregar_dias_administrativos(regs_por_dia, rut, desde_dt, hasta_dt):
-        """Mezcla en regs_por_dia los registros de dias_libres con motivo; calcula trabajado según horario."""
         conexion = sqlite3.connect("reloj_control.db")
         cursor = conexion.cursor()
         desde_str = desde_dt.strftime('%Y-%m-%d')
@@ -452,11 +527,6 @@ def construir_reportes(frame_padre):
 
     # -------- estadísticas y resumen del período --------
     def calcular_estadisticas_periodo(rut, registros_dict, desde_dt, hasta_dt):
-        """
-        Retorna dict con:
-          total_min_trabajados, total_min_atraso, dias_admin_usados, dias_admin_pendientes (o None),
-          feriados, dias_ok, dias_incompletos, obs_counter (Counter)
-        """
         total_min_trabajados = 0
         total_min_atraso = 0
         dias_ok = 0
@@ -480,7 +550,6 @@ def construir_reportes(frame_padre):
             if es_fer:
                 feriados += 1
 
-            # atraso (tolerancia 5m)
             if ingreso != "--":
                 try:
                     fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
@@ -512,7 +581,6 @@ def construir_reportes(frame_padre):
                 except Exception:
                     pass
 
-            # trabajado
             trabajado_str = info.get("trabajado")
             if not trabajado_str or trabajado_str == "0h 0min":
                 if ingreso != "--" and salida != "--":
@@ -541,14 +609,10 @@ def construir_reportes(frame_padre):
                         mins = 0
                 total_min_trabajados += mins
 
-            # estado del día
-            if (ingreso != "--" and salida != "--"):
+            if (ingreso != "--" and salida != "--") or es_admin or es_fer:
                 dias_ok += 1
             else:
-                if es_admin or es_fer:
-                    dias_ok += 1
-                else:
-                    dias_incompletos += 1
+                dias_incompletos += 1
 
             if es_admin:
                 admin_usados += 1
@@ -569,9 +633,9 @@ def construir_reportes(frame_padre):
             "obs_counter": obs_counter
         }
 
-    # -------- export EXCEL (respaldo si no hay reportlab) --------
-    def exportar_excel(datos_tabla, resumen, ruta_sugerida):
-        columnas = ["Fecha", "Ingreso", "Salida", "Horas Trabajadas Por Día", "Minutos Atraso Día", "Observación"]
+    # -------- export EXCEL (respaldo) --------
+    def exportar_excel(datos_tabla, resumen, ruta_sugerida, rut_para_extras):
+        columnas = ["Fecha", "Ingreso", "Salida", "Horas Trabajadas Por Día", "Minutos Atraso Día", "Min. Extra Mes", "Min. Extra Año (YTD)", "Observación"]
         df = pd.DataFrame(datos_tabla, columns=columnas)
         try:
             df.to_excel(ruta_sugerida, index=False)
@@ -581,11 +645,23 @@ def construir_reportes(frame_padre):
                 h, m = divmod(tmin, 60)
                 rws.append(["Horas trabajadas (período)", f"{h:02d}:{m:02d}"])
                 rws.append(["Minutos acumulados de atraso", resumen["total_min_atraso"]])
-                rws.append(["Días administrativos usados", resumen["dias_admin_usados"]])
-                rws.append(["Días administrativos pendientes", "—" if resumen["dias_admin_pendientes"] is None else resumen["dias_admin_pendientes"]])
+                rws.append(["Días administrativos usados (período)", resumen["dias_admin_usados"]])
+                rws.append(["Días administrativos pendientes (período)", "—" if resumen["dias_admin_pendientes"] is None else resumen["dias_admin_pendientes"]])
                 rws.append(["Feriados del período", resumen["feriados"]])
                 rws.append(["Días completos", resumen["dias_ok"]])
                 rws.append(["Días incompletos", resumen["dias_incompletos"]])
+
+                # NUEVO: Admin año + Extras año
+                anio_actual = datetime.now().year
+                limite_admin = obtener_cupo_admin_para_rut(rut_para_extras) or 6
+                admin_anio = contar_admin_anio(rut_para_extras, anio_actual)
+                admin_rest = max(0, limite_admin - admin_anio)
+                rws.append([f"Días administrativos usados (año {anio_actual})", f"{admin_anio}/{limite_admin} (restan {admin_rest})"])
+
+                extras_anio = sumar_minutos_extras_anio(rut_para_extras, anio_actual)
+                eh, em = divmod(int(extras_anio), 60)
+                rws.append([f"Extras acumulados (año {anio_actual})", f"{eh:02d}:{em:02d}"])
+
                 rws.append([])
                 rws.append(["Observaciones (Top 10)", "Veces"])
                 for obs, cnt in resumen["obs_counter"].most_common(10):
@@ -608,7 +684,7 @@ def construir_reportes(frame_padre):
             )
             carpeta_descargas = os.path.join(os.path.expanduser("~"), "Downloads")
             nombre_xlsx = f"reporte_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
-            exportar_excel(datos_tabla, resumen, os.path.join(carpeta_descargas, nombre_xlsx))
+            exportar_excel(datos_tabla, resumen, os.path.join(carpeta_descargas, nombre_xlsx), rut)
             return None
 
         carpeta_descargas = os.path.join(os.path.expanduser("~"), "Downloads")
@@ -629,17 +705,13 @@ def construir_reportes(frame_padre):
 
         story = []
 
-        # Título exacto
         story.append(Paragraph("Reporte de Asistencia", styles["Header"]))
-
-        # Línea periodo/generado
         story.append(Paragraph(
             f"Período: {periodo} &nbsp;&nbsp;|&nbsp;&nbsp; Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
             styles["Normal"]
         ))
         story.append(Spacer(1, 4))
 
-        # Bloque de datos del usuario (Nombre / Cargo)
         tabla_ident = Table(
             [
                 ["Nombre:", f"{nombre} {apellido}"],
@@ -659,17 +731,28 @@ def construir_reportes(frame_padre):
         story.append(KeepTogether([tabla_ident]))
         story.append(Spacer(1, 8))
 
-        # Resumen (bloque)
+        # RESUMEN (incluye admin año y extras año)
         tmin = resumen["total_min_trabajados"]
         h, m = divmod(tmin, 60)
+
+        anio_actual = datetime.now().year
+        admin_anio_usados = contar_admin_anio(rut, anio_actual)
+        limite_admin = obtener_cupo_admin_para_rut(rut) or 6
+        admin_anio_rest = max(0, limite_admin - admin_anio_usados)
+
+        extras_anio = sumar_minutos_extras_anio(rut, anio_actual)
+        eh, em = divmod(int(extras_anio), 60)
+
         filas_resumen = [
             ["Horas trabajadas en el período", f"{h:02d}:{m:02d}"],
             ["Minutos acumulados de atraso", f"{resumen['total_min_atraso']} min"],
-            ["Días administrativos usados", resumen["dias_admin_usados"]],
-            ["Días administrativos pendientes", "—" if resumen["dias_admin_pendientes"] is None else resumen["dias_admin_pendientes"]],
+            ["Días administrativos usados (período)", resumen["dias_admin_usados"]],
+            ["Días administrativos pendientes (período)", "—" if resumen["dias_admin_pendientes"] is None else resumen["dias_admin_pendientes"]],
             ["Feriados en el período", resumen["feriados"]],
             ["Días con registro completo", resumen["dias_ok"]],
             ["Días incompletos", resumen["dias_incompletos"]],
+            [f"Días administrativos usados (año {anio_actual})", f"{admin_anio_usados} / {limite_admin} (restan {admin_anio_rest})"],
+            [f"Extras acumulados (año {anio_actual})", f"{eh:02d}:{em:02d}"],
         ]
         tabla_resumen = Table(filas_resumen, colWidths=[120*mm, 40*mm])
         tabla_resumen.setStyle(TableStyle([
@@ -685,7 +768,6 @@ def construir_reportes(frame_padre):
         story.append(KeepTogether([Paragraph("<b>Resumen</b>", styles["Bold"]), Spacer(1, 2), tabla_resumen]))
         story.append(Spacer(1, 8))
 
-        # Top observaciones
         top_obs = [["Observación", "Veces"]]
         for obs, cnt in resumen["obs_counter"].most_common(10):
             top_obs.append([obs, cnt if cnt else 0])
@@ -706,16 +788,16 @@ def construir_reportes(frame_padre):
         story.append(KeepTogether([Paragraph("<b>Observaciones de Ingreso y Salida (Top 10)</b>", styles["Bold"]), Spacer(1, 2), tabla_obs]))
         story.append(Spacer(1, 8))
 
-        # Tabla de días
-        encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Min. Atraso Día", "Observación"]
+        # DETALLE DIARIO: añadimos "Min. Extra Año (YTD)" ANTES de Observación
+        encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Min. Atraso Día", "Min. Extra Mes", "Min. Extra Año (YTD)", "Observación"]
         tabla_data = [encabezados] + datos_tabla
-        col_widths = [28*mm, 20*mm, 20*mm, 24*mm, 26*mm, 150*mm]
+        col_widths = [28*mm, 20*mm, 20*mm, 24*mm, 26*mm, 26*mm, 30*mm, 114*mm]  # ~288mm
         tabla = Table(tabla_data, colWidths=col_widths, repeatRows=1)
         tabla.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e2e8f0")),
             ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
             ("ALIGN", (1,1), (3,-1), "CENTER"),
-            ("ALIGN", (4,1), (4,-1), "RIGHT"),
+            ("ALIGN", (4,1), (6,-1), "RIGHT"),
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
             ("FONTSIZE", (0,0), (-1,-1), 9),
             ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
@@ -726,15 +808,13 @@ def construir_reportes(frame_padre):
         story.append(Spacer(1, 2))
         story.append(tabla)
 
-        # Render
         doc.build(story)
 
-        # Guarda ruta del último PDF para el botón "Enviar por Correo"
         frame._ultimo_pdf_path = ruta
         if abrir:
             messagebox.showinfo("PDF generado", f"PDF guardado en Descargas:\n{os.path.basename(ruta)}")
             try:
-                os.startfile(ruta)  # Windows
+                os.startfile(ruta)
             except Exception:
                 pass
         return ruta
@@ -742,6 +822,8 @@ def construir_reportes(frame_padre):
     # -------- Construir filas para PDF --------
     def construir_datos_pdf(regs_por_dia, rut):
         datos = []
+        extras_mes_cache = {}   # (anio, mes) -> minutos
+        extras_ytd_cache = {}   # (anio, mes) -> minutos (enero..mes)
         for fecha in sorted(regs_por_dia):
             info = regs_por_dia[fecha]
             ingreso = info.get("ingreso", "--") or "--"
@@ -805,21 +887,39 @@ def construir_reportes(frame_padre):
                     except Exception:
                         pass
 
+            # Min. Extra Mes
+            try:
+                fdt = datetime.strptime(fecha, "%Y-%m-%d").date()
+                key = (fdt.year, fdt.month)
+                if key not in extras_mes_cache:
+                    val = leer_minutos_extra_mes(rut, fdt.year, fdt.month)
+                    extras_mes_cache[key] = int(val) if val is not None else 0
+                min_extra_mes = extras_mes_cache[key]
+            except Exception:
+                min_extra_mes = 0
+
+            # Min. Extra Año (YTD: enero..mes)
+            try:
+                key2 = (fdt.year, fdt.month)
+                if key2 not in extras_ytd_cache:
+                    extras_ytd_cache[key2] = int(sumar_minutos_extras_hasta_mes(rut, fdt.year, fdt.month))
+                min_extra_ytd = extras_ytd_cache[key2]
+            except Exception:
+                min_extra_ytd = 0
+
             datos.append([
                 datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y"),
-                ingreso, salida, trabajado, min_atraso, obs_txt
+                ingreso, salida, trabajado, min_atraso, min_extra_mes, min_extra_ytd, obs_txt
             ])
         return datos
 
     # -------- Ventana "Enviar por Correo" --------
     def abrir_envio_correo():
         ctx = getattr(frame, "_ultimo_contexto_pdf", None)
-
         if not ctx:
             messagebox.showwarning("Sin datos", "Primero genera un reporte (Buscar Reporte).")
             return
 
-        # Si no hay PDF reciente, generarlo silenciosamente
         ultimo_pdf = getattr(frame, "_ultimo_pdf_path", None)
         if (not ultimo_pdf or not os.path.exists(ultimo_pdf)) and HAS_PDF:
             try:
@@ -850,7 +950,6 @@ def construir_reportes(frame_padre):
         cont = ctk.CTkFrame(win, corner_radius=12)
         cont.pack(fill="both", expand=True, padx=16, pady=16)
 
-        # Para / CC / Asunto / Mensaje
         ctk.CTkLabel(cont, text="Destinatarios", font=("Arial", 16, "bold")).grid(row=0, column=0, columnspan=2, sticky="w", pady=(0,8))
 
         ctk.CTkLabel(cont, text="Para:").grid(row=1, column=0, sticky="e", padx=(0,8), pady=6)
@@ -861,7 +960,6 @@ def construir_reportes(frame_padre):
         entry_cc = ctk.CTkEntry(cont, width=420, placeholder_text="(opcional)")
         entry_cc.grid(row=2, column=1, sticky="w", pady=(0,6))
 
-        # Sugerir correo del trabajador (si existe)
         try:
             conx = sqlite3.connect("reloj_control.db")
             curx = conx.cursor()
@@ -898,13 +996,11 @@ def construir_reportes(frame_padre):
             txt_msg.pack()
             txt_msg.insert("1.0", msg_def)
 
-        # Adjuntar
         row5 = ctk.CTkFrame(cont, fg_color="transparent"); row5.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6,8))
         var_adj = tk.BooleanVar(value=True)
         adj_label = os.path.basename(ultimo_pdf) if (ultimo_pdf and os.path.exists(ultimo_pdf)) else "(se generará PDF)"
         ctk.CTkCheckBox(row5, text=f"Adjuntar PDF: {adj_label}", variable=var_adj).pack(anchor="w")
 
-        # Botones
         btns = ctk.CTkFrame(cont, fg_color="transparent"); btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10,0))
         ctk.CTkButton(btns, text="Cancelar", fg_color="#475569", command=win.destroy, width=120).pack(side="left", padx=(0,6))
 
@@ -918,8 +1014,6 @@ def construir_reportes(frame_padre):
                 return
             to_list = [p.strip() for p in to_raw.replace(",", ";").split(";") if p.strip()]
             cc_list = [c.strip() for c in cc_raw.replace(",", ";").split(";") if c.strip()]
-
-            # Generar si no hay PDF y el usuario quiere adjuntar
             attach_path = None
             if var_adj.get():
                 nonlocal_pdf = getattr(frame, "_ultimo_pdf_path", None)
@@ -960,10 +1054,7 @@ def construir_reportes(frame_padre):
                 messagebox.showerror("Error al enviar", f"No fue posible enviar el correo:\n{e}")
 
         ctk.CTkButton(btns, text="Enviar", fg_color="#22c55e", command=_enviar, width=160).pack(side="right", padx=(6,0))
-
         cont.grid_columnconfigure(1, weight=1)
-
-        # Geometría / foco
         master.update_idletasks()
         w, h = 640, 460
         x = master.winfo_x() + (master.winfo_width() // 2) - (w // 2)
@@ -1038,10 +1129,8 @@ def construir_reportes(frame_padre):
                 registros_por_dia[fecha]["salida"] = hora_salida
                 registros_por_dia[fecha]["obs_salida"] = observacion or registros_por_dia[fecha]["obs_salida"]
 
-        # Mezclar días administrativos
         agregar_dias_administrativos(registros_por_dia, rut, desde_dt, hasta_dt)
 
-        # Rellenar feriados del rango
         dia = desde_dt.date()
         while dia <= hasta_dt.date():
             fiso = dia.isoformat()
@@ -1057,7 +1146,6 @@ def construir_reportes(frame_padre):
                 }
             dia += timedelta(days=1)
 
-        # Completar días vacíos
         dia = desde_dt.date()
         while dia <= hasta_dt.date():
             fiso = dia.isoformat()
@@ -1071,7 +1159,6 @@ def construir_reportes(frame_padre):
                 }
             dia += timedelta(days=1)
 
-        # Regla Cometido: autocompletar salida con horario pactado
         for fecha, info in registros_por_dia.items():
             obs_txt = (info.get("obs_ingreso") or "") + " " + (info.get("obs_salida") or "") + " " + (info.get("motivo") or "")
             obs_txt = obs_txt.lower()
@@ -1100,7 +1187,6 @@ def construir_reportes(frame_padre):
                 if not info.get("obs_salida"):
                     info["obs_salida"] = "Salida autocompletada por Cometido"
 
-        # ---- Render tabla en pantalla
         if registros_por_dia:
             encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Obs. Ingreso", "Obs. Salida"]
             for col, texto in enumerate(encabezados):
@@ -1154,11 +1240,9 @@ def construir_reportes(frame_padre):
                         ctk.CTkLabel(frame_tabla, text=val).grid(row=fila, column=col, padx=10, pady=2)
                 fila += 1
 
-            # Totales de rango mostrado
             h_tot, m_tot = divmod(int(total_minutos), 60)
             label_total.configure(text=f"Total trabajado en el período (efectivo en tabla): {int(h_tot)}h {int(m_tot)}min", text_color="white")
 
-            # Total semanal (visual)
             hoy = datetime.today().date()
             inicio_semana = hoy - timedelta(days=hoy.weekday())
             fin_semana = inicio_semana + timedelta(days=6)
@@ -1183,7 +1267,6 @@ def construir_reportes(frame_padre):
             h_sem, m_sem = divmod(int(minutos_semana), 60)
             label_total_semana.configure(text=f"Total trabajado en la semana (efectivo): {h_sem}h {m_sem}min")
 
-            # Carga Horaria semanal
             minutos_carga = calcular_carga_horaria_semana(rut)
             h_pac, m_pac = divmod(int(minutos_carga), 60)
             cumple = minutos_semana >= minutos_carga
@@ -1193,20 +1276,30 @@ def construir_reportes(frame_padre):
                 text_color="green" if cumple else "orange"
             )
 
-            # Resumen para PDF
             resumen = calcular_estadisticas_periodo(rut, registros_por_dia, desde_dt, hasta_dt)
             h_all, m_all = divmod(int(resumen["total_min_trabajados"]), 60)
+
+            # NUEVO: Admin año + Extras año en la UI
+            anio_actual = datetime.now().year
+            limite_admin = obtener_cupo_admin_para_rut(rut) or 6
+            admin_anio = contar_admin_anio(rut, anio_actual)
+            admin_rest = max(0, limite_admin - admin_anio)
+
+            extras_anio = sumar_minutos_extras_anio(rut, anio_actual)
+            eh, em = divmod(int(extras_anio), 60)
+
             label_resumen.configure(
                 text=(
                     f"Resumen (período): Trabajado {h_all:02d}:{m_all:02d} | "
                     f"Atraso {resumen['total_min_atraso']} min | "
                     f"Admin usados {resumen['dias_admin_usados']} | "
                     f"Admin pendientes {'—' if resumen['dias_admin_pendientes'] is None else resumen['dias_admin_pendientes']} | "
-                    f"Feriados {resumen['feriados']} | Completos {resumen['dias_ok']} | Incompletos {resumen['dias_incompletos']}"
+                    f"Feriados {resumen['feriados']} | Completos {resumen['dias_ok']} | Incompletos {resumen['dias_incompletos']} | "
+                    f"Admin año {anio_actual}: {admin_anio}/{limite_admin} (restan {admin_rest}) | "
+                    f"Extras año {anio_actual}: {eh:02d}:{em:02d}"
                 )
             )
 
-            # Guardamos contexto para PDF y Email
             frame._ultimo_contexto_pdf = {
                 "rut": rut,
                 "nombre": nombre,
@@ -1217,7 +1310,6 @@ def construir_reportes(frame_padre):
                 "datos_tabla": construir_datos_pdf(registros_por_dia, rut),
                 "resumen": resumen
             }
-            # Limpia la ruta del anterior PDF hasta que se genere uno nuevo
             frame._ultimo_pdf_path = None
 
             label_estado.configure(text="✅ Reporte generado", text_color="green")

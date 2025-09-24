@@ -19,11 +19,46 @@ SMTP_USER = "documentos_bd@bioaccess.cl"
 SMTP_PASS = "documentos@2025"
 USAR_SMTP = True
 
+# ==================== PDF (para Lista Manual) ====================
+try:
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    PDF_OK_NOMINA = True
+except Exception:
+    PDF_OK_NOMINA = False
+
 # ==================== Configuración UI / Data ====================
 CHUNK_SIZE = 200
 DEBOUNCE_MS = 250
 DAYS_ORDER = ['Lunes', 'Martes', 'Miércoles', 'Jueves', 'Viernes', 'Sábado', 'Domingo']
 PERIODS = ["Mañana", "Tarde", "Nocturna"]  # columnas
+
+# ---------- Utilidades generales ----------
+def _downloads_dir():
+    home = os.path.expanduser("~")
+    cand = os.path.join(home, "Downloads")
+    if os.path.isdir(cand): return cand
+    xdg = os.environ.get("XDG_DOWNLOAD_DIR")
+    if xdg and os.path.isdir(xdg): return xdg
+    return home
+
+def _open_file(path):
+    try:
+        if os.name == "nt":
+            os.startfile(path)  # type: ignore
+        elif os.uname().sysname == "Darwin":
+            import subprocess
+            subprocess.Popen(["open", path])
+        else:
+            import subprocess
+            subprocess.Popen(["xdg-open", path])
+    except Exception:
+        try:
+            webbrowser.open(f"file://{os.path.abspath(path)}")
+        except Exception:
+            pass
 
 # ---------- Utilidades DB ----------
 def _ensure_indexes():
@@ -88,13 +123,28 @@ def _fetch_page(filtro: str, sort_col: str, sort_dir_asc: bool, limit: int, offs
     con.close()
     return rows
 
+def _fetch_all_for_rollcall():
+    """Lista completa para la 'lista manual': (nombre completo, rut, profesion, correo) A→Z."""
+    con = sqlite3.connect(DB)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT TRIM(IFNULL(nombre,'')) || ' ' || TRIM(IFNULL(apellido,''))  AS nombre,
+               rut,
+               IFNULL(profesion,'-') AS profesion,
+               IFNULL(correo,'-')    AS correo
+        FROM trabajadores
+        ORDER BY apellido COLLATE NOCASE ASC, nombre COLLATE NOCASE ASC
+    """)
+    rows = cur.fetchall()
+    con.close()
+    return rows
+
 # ---------- HORARIO: Pivot directo en SQL ----------
 def _fetch_matrix_por_rut_sql(rut: str):
     """
     Devuelve (matrix, ignored_total) ya pivotado:
     matrix = {dia: {'Mañana':(he,hs)|'-', 'Tarde':..., 'Nocturna':...}}
     Ignora filas con hora_entrada/salida vacías. Asigna por orden de inicio.
-    Compatible con SQLite sin funciones ventana (ROW_NUMBER emulado).
     """
     con = sqlite3.connect(DB)
     cur = con.cursor()
@@ -119,7 +169,7 @@ def _fetch_matrix_por_rut_sql(rut: str):
     valid_rows = cur.fetchone()[0] or 0
     ignored_total = max(total_rows - valid_rows, 0)
 
-    # Pivot: 1º bloque del día -> Mañana, 2º -> Tarde, 3º -> Nocturna
+    # Pivot
     cur.execute(f"""
         WITH clean AS (
           SELECT dia,
@@ -225,7 +275,7 @@ def _matrix_to_html(nombre, rut, profesion, correo, cumple, matrix, ignored=0):
             "</tr>"
         )
 
-    # --- Badge especial para correo: fondo claro + link con color controlado ---
+    # Badge correo
     if correo and correo != "-":
         email_badge = (
             "<span style=\"display:inline-block;background:#eaf2fb;border:1px solid #bfd6f7;"
@@ -250,7 +300,6 @@ def _matrix_to_html(nombre, rut, profesion, correo, cumple, matrix, ignored=0):
   <div style="max-width:900px;margin:0 auto;background:{CARD_BG};border:1px solid {BORDER};border-radius:12px;padding:20px;box-sizing:border-box">
     <h1 style="margin:0 0 8px 0;font-size:22px;color:{TEXT}">Horario de {nombre}</h1>
 
-    <!-- Mensaje profesional -->
     <p style="margin:8px 0 14px 0;line-height:1.55;color:{TEXT}">
       Estimado(a), junto con saludar, se remite el detalle de horario vigente del funcionario indicado más abajo.
       Este informe es generado automáticamente por <strong>BioAccess – Control de Horarios</strong> y tiene fines informativos internos.
@@ -261,7 +310,7 @@ def _matrix_to_html(nombre, rut, profesion, correo, cumple, matrix, ignored=0):
       <span style="display:inline-block;background:{ACCENT};color:{TH_TXT};border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px">RUT: {rut}</span>
       <span style="display:inline-block;background:{ACCENT};color:{TH_TXT};border-radius:8px;padding:4px 10px;font-size:12px;margin-right:6px">Cargo: {profesion}</span>
       {email_badge}
-      <span style="display:inline-block;background:{ACCENT};color:{TH_TXT};border-radius:8px;padding:4px 10px;font-size:12px">Cumple: {cumple}</span>
+      <span style="display:inline-block;background:{ACCENT};color:{TH_TXT};border-radius:8px;padding:4px 10px;font-size:12px">Cumpleaños: {cumple}</span>
     </div>
 
     {warn}
@@ -296,8 +345,6 @@ def _matrix_to_html(nombre, rut, profesion, correo, cumple, matrix, ignored=0):
 </body>
 </html>"""
     return html
-
-
 
 def _save_html_and_open(nombre, rut, profesion, correo, cumple, matrix, ignored=0, open_after=True):
     html = _matrix_to_html(nombre, rut, profesion, correo, cumple, matrix, ignored)
@@ -399,6 +446,70 @@ def _send_email(remitente_user, remitente_pass, host, port, to_list, cc_list, su
     except Exception as e:
         tk.messagebox.showerror("Correo", f"No fue posible enviar el correo:\n{e}")
         return False
+
+# ---------- PDF: Lista manual (apaisado) ----------
+def _build_rollcall_pdf(path_pdf, rows):
+    """
+    rows: lista de tuplas (nombre, rut, profesion, correo), ordenadas A→Z
+    """
+    styles = getSampleStyleSheet()
+    elements = []
+    elements.append(Paragraph("<b>Lista Manual de Funcionarios</b>", styles["Title"]))
+    elements.append(Paragraph("Sistema BioAccess – Control de Horarios", styles["Normal"]))
+    elements.append(Spacer(0, 10))
+
+    # Encabezados
+    data = [["Nombre", "RUT", "Profesión", "Correo", "Firma"]]
+
+    # Celdas como Paragraph para ajuste automático
+    for nombre, rut, profesion, correo in rows:
+        data.append([
+            Paragraph(nombre or "", styles["Normal"]),
+            rut or "",
+            Paragraph(profesion or "-", styles["Normal"]),
+            Paragraph(correo or "-", styles["Normal"]),
+            ""
+        ])
+
+    # A4 apaisado: ancho útil ≈ 842 - 72 = 770 pt
+    w_nombre = 240
+    w_rut    = 110
+    w_prof   = 150
+    w_correo = 210
+    w_firma  = 60
+    col_widths = [w_nombre, w_rut, w_prof, w_correo, w_firma]  # suma = 770
+
+    table = Table(data, colWidths=col_widths, repeatRows=1)
+
+    ts = [
+        ("FONTNAME",   (0,0), (-1,0), "Helvetica-Bold"),
+        ("FONTSIZE",   (0,0), (-1,0), 11),
+        ("BACKGROUND", (0,0), (-1,0), colors.whitesmoke),
+        ("GRID",       (0,0), (-1,-1), 0.25, colors.lightgrey),
+        ("VALIGN",     (0,0), (-1,-1), "MIDDLE"),
+        ("FONTSIZE",   (0,1), (-1,-1), 9),
+        ("LEFTPADDING",(0,0), (-1,-1), 4),
+        ("RIGHTPADDING",(0,0),(-1,-1), 4),
+        ("TOPPADDING", (0,0), (-1,-1), 3),
+        ("BOTTOMPADDING",(0,0),(-1,-1), 3),
+    ]
+    # filas alternadas
+    for r in range(1, len(data)):
+        if r % 2 == 0:
+            ts.append(("BACKGROUND", (0,r), (-1,r), colors.Color(0.98, 0.98, 0.98)))
+    table.setStyle(TableStyle(ts))
+
+    elements.append(table)
+    elements.append(Spacer(0, 8))
+    gen = datetime.now().strftime("%d/%m/%Y %H:%M")
+    elements.append(Paragraph(f"Generado por BioAccess — {gen}", styles["Italic"]))
+
+    doc = SimpleDocTemplate(
+        path_pdf,
+        pagesize=landscape(A4),
+        leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36
+    )
+    doc.build(elements)
 
 # ---------- UI ----------
 def construir_nomina(frame_padre):
@@ -572,9 +683,11 @@ def construir_nomina(frame_padre):
     # Botonera bajo el horario
     btns_frame = ctk.CTkFrame(detail, fg_color="transparent")
     btns_frame.grid(row=5, column=0, sticky="ew", padx=10, pady=(0, 10))
+    btn_rollcall = ctk.CTkButton(btns_frame, text="Lista manual (PDF)")
     btn_export = ctk.CTkButton(btns_frame, text="Exportar (PDF/HTML)")
     btn_print  = ctk.CTkButton(btns_frame, text="Imprimir")
     btn_send   = ctk.CTkButton(btns_frame, text="Enviar por correo")
+    btn_rollcall.pack(side="left", padx=(0,8))
     btn_export.pack(side="left", padx=(0,8))
     btn_print.pack(side="left", padx=(0,8))
     btn_send.pack(side="left", padx=(0,8))
@@ -711,7 +824,7 @@ def construir_nomina(frame_padre):
     entry_search.bind("<KeyRelease>", _on_search_changed)
     btn_clear.configure(command=lambda: (entry_search.delete(0, "end"), _on_search_changed()))
 
-    # 🔧 Reemplazo seguro del bind global (Ctrl+F) — sin usar bind_all
+    # Ctrl+F -> foco en búsqueda
     try:
         root.winfo_toplevel().bind("<Control-f>", lambda e: entry_search.focus_set())
     except Exception:
@@ -727,7 +840,6 @@ def construir_nomina(frame_padre):
             if sel:
                 iid = sel[0]
         if iid:
-            # iid es el RUT porque lo usamos como iid al insertar
             return str(iid)
         return None
 
@@ -777,7 +889,7 @@ def construir_nomina(frame_padre):
         matrix, ignored = _fetch_matrix_por_rut_sql(rut)
         _render_table(matrix, ignored=ignored)
 
-        # Acciones
+        # Acciones por-funcionario
         def do_export():
             pdf_path = _save_pdf_report(nombre_comp, rut, profesion, correo, cumple, matrix)
             if pdf_path:
@@ -816,7 +928,6 @@ def construir_nomina(frame_padre):
             matrix_txt = _matrix_to_text(matrix)
             html_body = _matrix_to_html(nombre_comp, rut, profesion, correo, cumple, matrix, ignored=ignored)
 
-            # ======= NUEVO: texto profesional + sello de generación =======
             gen = datetime.now().strftime("%d-%m-%Y %H:%M")
             intro = (
                 "Estimado(a), junto con saludar, se remite el detalle de horario vigente.\n"
@@ -831,14 +942,12 @@ def construir_nomina(frame_padre):
                 f"{matrix_txt}\n\n"
                 f"BioAccess."
             )
-            # (opcional) cambia el asunto si prefieres
             subject = f"Horario vigente – {nombre_comp} ({rut})"
 
             ok = _send_email(SMTP_USER, SMTP_PASS, SMTP_HOST, SMTP_PORT,
                             to_list, cc_list, subject, text_body, html_body)
             if ok:
                 tk.messagebox.showinfo("Correo", "Horario enviado correctamente.")
-
 
         btn_export.configure(command=do_export)
         btn_print.configure(command=do_print)
@@ -849,6 +958,25 @@ def construir_nomina(frame_padre):
         for ev in ("<<TreeviewSelect>>", "<ButtonRelease-1>", "<KeyRelease-Up>", "<KeyRelease-Down>", "<Return>", "<Double-1>"):
             tree.bind(ev, lambda e: root.after(1, _on_select))
     _bind_selection_events()
+
+    # ===== Lista manual (PDF) — todos los funcionarios =====
+    def do_rollcall_pdf():
+        if not PDF_OK_NOMINA:
+            return tk.messagebox.showerror("PDF", "Instala reportlab: pip install reportlab")
+
+        rows = _fetch_all_for_rollcall()
+        if not rows:
+            return tk.messagebox.showinfo("Lista manual", "No hay funcionarios en la base de datos.")
+
+        out = os.path.join(_downloads_dir(), f"Lista_Manual_Funcionarios_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf")
+        try:
+            _build_rollcall_pdf(out, rows)
+            tk.messagebox.showinfo("Lista manual (PDF)", f"PDF generado:\n{out}")
+            _open_file(out)
+        except Exception as e:
+            tk.messagebox.showerror("Lista manual", f"No se pudo generar el PDF:\n{e}")
+
+    btn_rollcall.configure(command=do_rollcall_pdf)
 
     # Carga inicial
     _reload_from_scratch()
