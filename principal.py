@@ -12,6 +12,7 @@ from panel_avanzado import construir_panel_avanzado
 from solicitudes import construir_solicitudes
 from cambio_clave_admin import abrir_cambio_clave
 from dia_administrativo import construir_dia_administrativo
+from resumen_dia import construir_resumen_dia
 
 # ========== Utilidades de ruta ==========
 def app_path() -> str:
@@ -35,8 +36,29 @@ admin_info = None  # Almacena los datos del administrador logueado
 
 # ========== Ventana ==========
 app = ctk.CTk()
-app.geometry("1200x600")
 app.title("BioAccess/Control de Horarios | www.bioaccess.cl")
+
+# Tamaño mínimo si se desmaximiza (opcional pero recomendado)
+app.minsize(1200, 700)  # ← NUEVO
+
+# Maximizar con fallback multiplataforma y reintento tras el primer render
+def _maximizar():
+    try:
+        app.state("zoomed")          # Windows
+    except Exception:
+        try:
+            app.attributes("-zoomed", True)  # Linux/otros
+        except Exception:
+            # Fallback: ocupar toda la pantalla
+            app.update_idletasks()
+            sw, sh = app.winfo_screenwidth(), app.winfo_screenheight()
+            app.geometry(f"{sw}x{sh}+0+0")
+
+# Llamar ahora...
+_maximizar()
+# ...y volver a llamarlo después del primer dibujo para evitar que se “achique”
+app.after_idle(_maximizar)  # ← NUEVO
+
 
 # ========== Inicializar base de datos ==========
 try:
@@ -410,6 +432,14 @@ btn_admin.pack(side="left", padx=5)
 # Botón Salir (lado derecho)
 btn_salir = ctk.CTkButton(menu, text="Salir", command=app.destroy)
 btn_salir.pack(side="right", padx=5)
+
+# Botón Resumen Diario (visible para todos)
+btn_resumen = ctk.CTkButton(
+    menu, text="Resumen Diario",
+    command=lambda: [limpiar_frame(), construir_resumen_dia(frame_contenedor), resaltar_boton_activo("resumen")]
+)
+btn_resumen.pack(side="left", padx=5)
+botones_menu["resumen"] = btn_resumen
 
 # ========== Inicio por defecto ==========
 try:

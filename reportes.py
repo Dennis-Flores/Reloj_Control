@@ -1,6 +1,7 @@
+# reportes.py (actualizado)
 import customtkinter as ctk
 import sqlite3
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 from tkcalendar import Calendar
 import tkinter as tk
 import pandas as pd
@@ -30,7 +31,11 @@ except Exception:
 # ========= Configuración de ajuste especial (43h/44h) =========
 AJUSTE_COLACION_FIJO_43_44 = True
 MINUTOS_AJUSTE_FIJO = 150
-TOLERANCIA_MIN = 5  # tolerancia
+TOLERANCIA_MIN = 5  # tolerancia ingreso
+
+# ========= Política de salida (misma que en ingreso_salida) =========
+SALIDA_TOLERANCIA_MIN = 5           # ±5 min de tolerancia visual (salida)
+LATE_AFTER_EXIT_MINUTES = 40        # 40+ min tarde → (en capturador se pide observación)
 
 # ========= Fallback SMTP =========
 SMTP_FALLBACK = {
@@ -89,8 +94,27 @@ def obtener_horario_del_dia(rut, fecha_dt):
         return (None, None)
 
     he = filas[0][0].strip() if filas[0][0] else None
-    hs = filas[-1][1].strip() if filas[-1][1] else None
+    hs = filas[-1][1].strip() if filas[-1][1] else None  # ÚLTIMA SALIDA (fin de jornada)
     return (he, hs)
+
+def obtener_horario_base(rut):
+    """Devuelve (hora_entrada_base, hora_salida_base) tomando
+    la mínima entrada y la máxima salida de la tabla de horarios del trabajador."""
+    try:
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        cur.execute("""
+            SELECT MIN(time(hora_entrada)), MAX(time(hora_salida))
+            FROM horarios
+            WHERE rut=?
+        """, (rut,))
+        row = cur.fetchone()
+        con.close()
+        he = row[0] if row and row[0] else None
+        hs = row[1] if row and row[1] else None
+        return he, hs
+    except Exception:
+        return (None, None)
 
 # ===================== Datos del trabajador =====================
 
@@ -186,7 +210,6 @@ def contar_admin_anio(rut: str, anio: int | None = None) -> int:
             anio = datetime.now().year
         con = sqlite3.connect("reloj_control.db")
         cur = con.cursor()
-        # Ajusta a LIKE si tus motivos no son exactos:
         cur.execute("""
             SELECT COUNT(*)
             FROM dias_libres
@@ -211,7 +234,7 @@ def _detectar_tabla_extras(conn):
 
     candidatos = [
         "extras_mensuales", "extras_mensual", "minutos_extra_mensual",
-        "minutos_extras_mensuales", "saldo_extras_mensual", "acumulado_extras_mensual"
+               "minutos_extras_mensuales", "saldo_extras_mensual", "acumulado_extras_mensual"
     ]
     for t in tablas:
         if t.lower() in candidatos:
@@ -266,7 +289,6 @@ def leer_minutos_extra_mes(rut, anio, mes):
     except Exception:
         return None
 
-# === NUEVO: acumulado anual de extras (reinicia cada año) ===
 def sumar_minutos_extras_anio(rut, anio):
     total = 0
     for m in range(1, 13):
@@ -275,7 +297,6 @@ def sumar_minutos_extras_anio(rut, anio):
             total += int(mins)
     return total
 
-# === NUEVO: acumulado YTD hasta un mes dado (para tabla diaria) ===
 def sumar_minutos_extras_hasta_mes(rut, anio, mes):
     total = 0
     for m in range(1, mes+1):
@@ -409,10 +430,252 @@ def _html_email_informe(periodo: str, identidad: str):
 </body>
 </html>"""
 
+# ===================== Construcción de RESUMEN MENSUAL =====================
+
+def _month_range(anio, mes):
+    first = date(anio, mes, 1)
+    if mes == 12:
+        last = date(anio+1, 1, 1) - timedelta(days=1)
+    else:
+        last = date(anio, mes+1, 1) - timedelta(days=1)
+    return first, last
+
+def _contar_licencia_y_otros_mes(rut, anio, mes):
+    """Cuenta días de licencia (motivo LIKE 'Licencia%') y otros permisos (distintos a 'Día Administrativo' y no 'Licencia%')."""
+    try:
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        desde, hasta = _month_range(anio, mes)
+        cur.execute("""
+            SELECT motivo, COUNT(*) 
+            FROM dias_libres
+            WHERE rut=? AND fecha BETWEEN ? AND ?
+            GROUP BY motivo
+        """, (rut, desde.isoformat(), hasta.isoformat()))
+        rows = cur.fetchall()
+        con.close()
+        lic = 0
+        otros = 0
+        for motivo, cnt in rows:
+            m = (motivo or "").strip()
+            if m.lower() == "día administrativo" or m.lower() == "dia administrativo":
+                continue
+            if m.lower().startswith("licencia"):
+                lic += int(cnt or 0)
+            else:
+                otros += int(cnt or 0)
+        return lic, otros
+    except Exception:
+        return 0, 0
+
+def _obtener_registros_mes(rut, anio, mes):
+    con = sqlite3.connect("reloj_control.db")
+    cur = con.cursor()
+    desde, hasta = _month_range(anio, mes)
+    cur.execute("""
+        SELECT fecha, hora_ingreso, hora_salida, observacion
+        FROM registros
+        WHERE rut=? AND fecha BETWEEN ? AND ?
+        ORDER BY fecha
+    """, (rut, desde.isoformat(), hasta.isoformat()))
+    rows = cur.fetchall()
+    con.close()
+    reg = {}
+    for fecha, hi, hs, obs in rows:
+        reg[fecha] = {"ingreso": hi or "--", "salida": hs or "--", "obs": obs or ""}
+    # Asegurar todos los días del mes
+    dia = desde
+    while dia <= hasta:
+        fiso = dia.isoformat()
+        if fiso not in reg:
+            reg[fiso] = {"ingreso": "--", "salida": "--", "obs": ""}
+        dia += timedelta(days=1)
+    return reg
+
+def _calcular_metricas_mes(rut, anio, mes):
+    registros = _obtener_registros_mes(rut, anio, mes)
+    total_min_atraso = 0
+    ci_cumple = 0
+    ci_total = 0
+    cs_cumple = 0
+    cs_total = 0
+    filas_diarias = []  # [Fecha, Ingreso, Salida, cumpl_ing, cumpl_sal, atraso_min, obs]
+
+    for fiso in sorted(registros.keys()):
+        info = registros[fiso]
+        ingreso = info["ingreso"] or "--"
+        salida = info["salida"] or "--"
+        obs = info["obs"] or ""
+
+        he, hs = obtener_horario_del_dia(rut, fiso)
+        atraso_min = 0
+        if ingreso != "--" and he:
+            t_i = _ph_any(ingreso)
+            t_e = _ph_any(he)
+            if t_i and t_e:
+                base = datetime.strptime(fiso, "%Y-%m-%d").date()
+                di = datetime.combine(base, t_i.time())
+                de = datetime.combine(base, t_e.time())
+                delta = (di - de).total_seconds()
+                if delta > 60 * TOLERANCIA_MIN:
+                    atraso_min = math.ceil((delta - 60 * TOLERANCIA_MIN) / 60.0)
+                    total_min_atraso += atraso_min
+
+        cumpl_i = "—"
+        if he and ingreso != "--":
+            ci_total += 1
+            try:
+                t_i = _ph_any(ingreso); t_e = _ph_any(he)
+                base = datetime.strptime(fiso, "%Y-%m-%d").date()
+                di = datetime.combine(base, t_i.time())
+                de = datetime.combine(base, t_e.time())
+                cumpl = di <= (de + timedelta(minutes=TOLERANCIA_MIN))
+                cumpl_i = "Sí" if cumpl else "No"
+                if cumpl: ci_cumple += 1
+            except Exception:
+                pass
+
+        cumpl_s = "—"
+        if hs and salida != "--":
+            cs_total += 1
+            try:
+                t_s = _ph_any(salida); t_e = _ph_any(hs)
+                base = datetime.strptime(fiso, "%Y-%m-%d").date()
+                ds = datetime.combine(base, t_s.time())
+                de = datetime.combine(base, t_e.time())
+                cumpl = ds >= (de - timedelta(minutes=SALIDA_TOLERANCIA_MIN))
+                cumpl_s = "Sí" if cumpl else "No"
+                if cumpl: cs_cumple += 1
+            except Exception:
+                pass
+
+        filas_diarias.append([
+            datetime.strptime(fiso, "%Y-%m-%d").strftime("%d/%m/%Y"),
+            ingreso, salida, cumpl_i, cumpl_s, atraso_min, obs
+        ])
+
+    return {
+        "total_min_atraso": int(total_min_atraso),
+        "cumpl_ingreso": (int(ci_cumple), int(ci_total)),
+        "cumpl_salida": (int(cs_cumple), int(cs_total)),
+        "filas_diarias": filas_diarias
+    }
+
+def _exportar_pdf_mensual_usuario(rut, nombre, apellido, cargo, anio, mes,
+                                  total_min_atraso, cumpl_i, cumpl_s, minutos_extras_mes,
+                                  admin_anio_usados, admin_cupo, lic_dias, otros_dias,
+                                  horario_base, filas_diarias, carpeta_destino=None):
+    if not HAS_PDF:
+        raise RuntimeError("ReportLab no está disponible. Instala con: pip install reportlab")
+
+    carpeta_destino = carpeta_destino or os.path.join(os.path.expanduser("~"), "Downloads")
+    os.makedirs(carpeta_destino, exist_ok=True)
+    nombre_pdf = f"reporte_mensual_{rut}_{anio}{mes:02d}.pdf"
+    ruta = os.path.join(carpeta_destino, nombre_pdf)
+
+    periodo = f"{mes:02d}/{anio}"
+    he_base, hs_base = horario_base
+
+    doc = SimpleDocTemplate(
+        ruta,
+        pagesize=landscape(A4),
+        rightMargin=14*mm, leftMargin=14*mm,
+        topMargin=12*mm, bottomMargin=12*mm
+    )
+
+    styles = getSampleStyleSheet()
+    styles.add(ParagraphStyle(name="Small", fontSize=9, leading=11))
+    styles.add(ParagraphStyle(name="Bold", parent=styles["Normal"], fontSize=10, leading=12, spaceBefore=2, spaceAfter=2))
+    styles.add(ParagraphStyle(name="Header", parent=styles["Title"], fontSize=18, leading=22, alignment=TA_LEFT))
+
+    story = []
+    story.append(Paragraph("Reporte de Asistencia – Resumen Mensual", styles["Header"]))
+    story.append(Paragraph(
+        f"Período: {periodo} | Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+        styles["Normal"]
+    ))
+    story.append(Spacer(1, 4))
+
+    # Identificación
+    tabla_ident = Table([
+        ["Nombre:", f"{nombre} {apellido}"],
+        ["RUT:", rut],
+        ["Cargo:", cargo or ""],
+        ["Horario base:", f"{he_base or '—'} a {hs_base or '—'}"],
+    ], colWidths=[30*mm, 110*mm])
+    tabla_ident.setStyle(TableStyle([
+        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("BACKGROUND", (0,0), (0,-1), colors.HexColor("#f0f4f8")),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(KeepTogether([tabla_ident]))
+    story.append(Spacer(1, 8))
+
+    # Resumen mensual
+    ci_cumple, ci_total = cumpl_i
+    cs_cumple, cs_total = cumpl_s
+    ci_pct = (ci_cumple/ci_total*100) if ci_total else 0
+    cs_pct = (cs_cumple/cs_total*100) if cs_total else 0
+    admin_rest = max(0, (admin_cupo or 0) - (admin_anio_usados or 0))
+
+    filas_resumen = [
+        ["Cumplimiento ingreso (mes)", f"{ci_cumple}/{ci_total} ({ci_pct:.0f}%)"],
+        ["Cumplimiento salida (mes)", f"{cs_cumple}/{cs_total} ({cs_pct:.0f}%)"],
+        ["Total minutos de atraso (mes)", f"{total_min_atraso} min"],
+        ["Minutos extras del mes", f"{(minutos_extras_mes or 0)} min"],
+        [f"Días administrativos usados (año {anio})", f"{admin_anio_usados or 0} / {(admin_cupo or '—')} (restan {admin_rest})"],
+        ["Días con licencia (mes)", lic_dias],
+        ["Otros permisos (mes)", otros_dias],
+    ]
+    tabla_resumen = Table(filas_resumen, colWidths=[120*mm, 50*mm])
+    tabla_resumen.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (1,0), colors.HexColor("#f0f4f8")),
+        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("ALIGN", (1,0), (1,-1), "RIGHT"),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("FONTSIZE", (0,0), (-1,-1), 10),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+    ]))
+    story.append(KeepTogether([Paragraph("<b>Resumen del mes</b>", styles["Bold"]), Spacer(1, 2), tabla_resumen]))
+    story.append(Spacer(1, 8))
+
+    # Tabla diaria compacta (observación con wrap usando Paragraph)
+    encabezados = ["Fecha", "Ingreso", "Salida", "¿Cumpl. Ing.?", "¿Cumpl. Sal.?", "Atraso (min)", "Observación"]
+    data = [encabezados]
+    for fila in filas_diarias:
+        obs_p = Paragraph(str(fila[-1] or ""), styles["Small"])
+        data.append(fila[:-1] + [obs_p])
+
+    col_widths = [26*mm, 22*mm, 22*mm, 28*mm, 28*mm, 22*mm, 120*mm]
+    tabla = Table(data, colWidths=col_widths, repeatRows=1)
+    tabla.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e2e8f0")),
+        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
+        ("ALIGN", (1,1), (5,-1), "CENTER"),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
+        ("LEFTPADDING", (0,0), (-1,-1), 4),
+        ("RIGHTPADDING", (0,0), (-1,-1), 4),
+    ]))
+    story.append(Paragraph("<b>Detalle diario</b>", styles["Bold"]))
+    story.append(Spacer(1, 2))
+    story.append(tabla)
+
+    doc.build(story)
+    return ruta
+
 # ===================== Construir Reportes (UI + lógica) =====================
 
 def construir_reportes(frame_padre):
     registros_por_dia = {}
+    # Declaración para que existan en el scope antes de usarse en callbacks:
     label_estado = None
     label_datos = None
     label_total = None
@@ -420,6 +683,10 @@ def construir_reportes(frame_padre):
     label_pactadas = None
     label_completadas = None
     label_resumen = None
+    frame_tabla = None
+    entry_rut = None
+    entry_desde = None
+    entry_hasta = None
 
     # -------- calendario --------
     def seleccionar_fecha(entry_target):
@@ -633,9 +900,12 @@ def construir_reportes(frame_padre):
             "obs_counter": obs_counter
         }
 
-    # -------- export EXCEL (respaldo) --------
+    # -------- export EXCEL --------
     def exportar_excel(datos_tabla, resumen, ruta_sugerida, rut_para_extras):
-        columnas = ["Fecha", "Ingreso", "Salida", "Horas Trabajadas Por Día", "Minutos Atraso Día", "Min. Extra Mes", "Min. Extra Año (YTD)", "Observación"]
+        columnas = [
+            "Fecha", "Ingreso", "Esp. Ing.", "Salida", "Esp. Sal.",
+            "Horas Trabajadas Por Día", "Minutos Atraso Día", "Min. Extra Mes", "Min. Extra Año (YTD)", "Observación"
+        ]
         df = pd.DataFrame(datos_tabla, columns=columnas)
         try:
             df.to_excel(ruta_sugerida, index=False)
@@ -651,7 +921,6 @@ def construir_reportes(frame_padre):
                 rws.append(["Días completos", resumen["dias_ok"]])
                 rws.append(["Días incompletos", resumen["dias_incompletos"]])
 
-                # NUEVO: Admin año + Extras año
                 anio_actual = datetime.now().year
                 limite_admin = obtener_cupo_admin_para_rut(rut_para_extras) or 6
                 admin_anio = contar_admin_anio(rut_para_extras, anio_actual)
@@ -675,7 +944,7 @@ def construir_reportes(frame_padre):
         except Exception as e:
             messagebox.showerror("Error", f"No se pudo exportar Excel:\n{e}")
 
-    # -------- export PDF --------
+    # -------- export PDF (detalle período visible) --------
     def exportar_pdf(rut, nombre, apellido, cargo, periodo, datos_tabla, resumen, abrir=True):
         if not HAS_PDF:
             messagebox.showwarning(
@@ -707,7 +976,7 @@ def construir_reportes(frame_padre):
 
         story.append(Paragraph("Reporte de Asistencia", styles["Header"]))
         story.append(Paragraph(
-            f"Período: {periodo} &nbsp;&nbsp;|&nbsp;&nbsp; Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+            f"Período: {periodo} | Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
             styles["Normal"]
         ))
         story.append(Spacer(1, 4))
@@ -768,36 +1037,21 @@ def construir_reportes(frame_padre):
         story.append(KeepTogether([Paragraph("<b>Resumen</b>", styles["Bold"]), Spacer(1, 2), tabla_resumen]))
         story.append(Spacer(1, 8))
 
-        top_obs = [["Observación", "Veces"]]
-        for obs, cnt in resumen["obs_counter"].most_common(10):
-            top_obs.append([obs, cnt if cnt else 0])
-        if len(top_obs) == 1:
-            top_obs.append(["(Sin observaciones registradas)", 0])
+        # Encabezados con horas esperadas y Observación envuelta
+        encabezados = ["Fecha", "Ingreso", "Esp. Ing.", "Salida", "Esp. Sal.", "Trabajado", "Min. Atraso Día", "Min. Extra Mes", "Min. Extra Año (YTD)", "Observación"]
+        tabla_data = [encabezados]
+        for fila in datos_tabla:
+            # convertir observación a Paragraph para wrap
+            obs_p = Paragraph(str(fila[-1] or ""), styles["Small"])
+            fila_wrapped = list(fila[:-1]) + [obs_p]
+            tabla_data.append(fila_wrapped)
 
-        tabla_obs = Table(top_obs, colWidths=[140*mm, 20*mm])
-        tabla_obs.setStyle(TableStyle([
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#eef2ff")),
-            ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("ALIGN", (1,1), (1,-1), "RIGHT"),
-            ("VALIGN", (0,0), (-1,-1), "TOP"),
-            ("FONTSIZE", (0,0), (-1,-1), 9),
-            ("LEFTPADDING", (0,0), (-1,-1), 5),
-            ("RIGHTPADDING", (0,0), (-1,-1), 5),
-        ]))
-        story.append(KeepTogether([Paragraph("<b>Observaciones de Ingreso y Salida (Top 10)</b>", styles["Bold"]), Spacer(1, 2), tabla_obs]))
-        story.append(Spacer(1, 8))
-
-        # DETALLE DIARIO: añadimos "Min. Extra Año (YTD)" ANTES de Observación
-        encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Min. Atraso Día", "Min. Extra Mes", "Min. Extra Año (YTD)", "Observación"]
-        tabla_data = [encabezados] + datos_tabla
-        col_widths = [28*mm, 20*mm, 20*mm, 24*mm, 26*mm, 26*mm, 30*mm, 114*mm]  # ~288mm
+        col_widths = [22*mm, 18*mm, 18*mm, 18*mm, 18*mm, 22*mm, 22*mm, 24*mm, 28*mm, 112*mm]
         tabla = Table(tabla_data, colWidths=col_widths, repeatRows=1)
         tabla.setStyle(TableStyle([
             ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e2e8f0")),
             ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("ALIGN", (1,1), (3,-1), "CENTER"),
-            ("ALIGN", (4,1), (6,-1), "RIGHT"),
+            ("ALIGN", (1,1), (8,-1), "CENTER"),
             ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
             ("FONTSIZE", (0,0), (-1,-1), 9),
             ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
@@ -819,7 +1073,7 @@ def construir_reportes(frame_padre):
                 pass
         return ruta
 
-    # -------- Construir filas para PDF --------
+    # -------- Construir filas para PDF (detalle período visible) --------
     def construir_datos_pdf(regs_por_dia, rut):
         datos = []
         extras_mes_cache = {}   # (anio, mes) -> minutos
@@ -832,36 +1086,25 @@ def construir_reportes(frame_padre):
             obs_salida = info.get("obs_salida", "") or ""
             obs_txt = (obs_ingreso + (" | " if obs_ingreso and obs_salida else "") + obs_salida).strip()
 
+            # horas esperadas
+            he, hs = obtener_horario_del_dia(rut, fecha)
+            esp_ing = he or "—"
+            esp_sal = hs or "—"
+
             # atraso día
             min_atraso = 0
-            if ingreso != "--":
+            if ingreso != "--" and he:
                 try:
                     fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
-                    nombre_dia = fecha_dt.strftime("%A")
-                    dias_map = {
-                        "Monday": "Lunes", "Tuesday": "Martes", "Wednesday": "Miércoles",
-                        "Thursday": "Jueves", "Friday": "Viernes", "Saturday": "Sábado", "Sunday": "Domingo"
-                    }
-                    nombre_dia_es = dias_map.get(nombre_dia, "")
-                    con = sqlite3.connect("reloj_control.db")
-                    cur = con.cursor()
-                    cur.execute("""
-                        SELECT hora_entrada FROM horarios
-                        WHERE rut = ? AND dia = ?
-                    """, (rut, nombre_dia_es))
-                    res = cur.fetchone()
-                    con.close()
-                    if res:
-                        h_esp = res[0]
-                        t_i = _ph_any(ingreso)
-                        t_e = _ph_any(h_esp)
-                        if t_i and t_e:
-                            base = fecha_dt.date()
-                            t_i2 = datetime.combine(base, t_i.time())
-                            t_e2 = datetime.combine(base, t_e.time())
-                            delta = (t_i2 - t_e2).total_seconds()
-                            if delta > 300:
-                                min_atraso = math.ceil((delta - 300) / 60.0)
+                    t_i = _ph_any(ingreso)
+                    t_e = _ph_any(he)
+                    if t_i and t_e:
+                        base = fecha_dt.date()
+                        t_i2 = datetime.combine(base, t_i.time())
+                        t_e2 = datetime.combine(base, t_e.time())
+                        delta = (t_i2 - t_e2).total_seconds()
+                        if delta > 60*TOLERANCIA_MIN:
+                            min_atraso = math.ceil((delta - 60*TOLERANCIA_MIN) / 60.0)
                 except Exception:
                     pass
 
@@ -909,7 +1152,7 @@ def construir_reportes(frame_padre):
 
             datos.append([
                 datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y"),
-                ingreso, salida, trabajado, min_atraso, min_extra_mes, min_extra_ytd, obs_txt
+                ingreso, esp_ing, salida, esp_sal, trabajado, min_atraso, min_extra_mes, min_extra_ytd, obs_txt
             ])
         return datos
 
@@ -982,13 +1225,13 @@ def construir_reportes(frame_padre):
 
         ctk.CTkLabel(cont, text="Mensaje:").grid(row=4, column=0, sticky="ne", padx=(0,8), pady=(4,6))
         Textbox = getattr(ctk, "CTkTextbox", None)
+        msg_def = (
+            f"Estimado(a):\n\nAdjunto el reporte de asistencia correspondiente al período {ctx['periodo']}.\n"
+            f"Funcionario: {ctx['identidad']}\n\nSaludos cordiales."
+        )
         if Textbox:
             txt_msg = Textbox(cont, width=420, height=150)
             txt_msg.grid(row=4, column=1, sticky="w", pady=(4,6))
-            msg_def = (
-                f"Estimado(a):\n\nAdjunto el reporte de asistencia correspondiente al período {ctx['periodo']}.\n"
-                f"Funcionario: {ctx['identidad']}\n\nSaludos cordiales."
-            )
             txt_msg.insert("1.0", msg_def)
         else:
             wrap = tk.Frame(cont); wrap.grid(row=4, column=1, sticky="w", pady=(4,6))
@@ -998,7 +1241,7 @@ def construir_reportes(frame_padre):
 
         row5 = ctk.CTkFrame(cont, fg_color="transparent"); row5.grid(row=5, column=0, columnspan=2, sticky="w", pady=(6,8))
         var_adj = tk.BooleanVar(value=True)
-        adj_label = os.path.basename(ultimo_pdf) if (ultimo_pdf and os.path.exists(ultimo_pdf)) else "(se generará PDF)"
+        adj_label = os.path.basename(getattr(frame, "_ultimo_pdf_path", "") or "") or "(se generará PDF)"
         ctk.CTkCheckBox(row5, text=f"Adjuntar PDF: {adj_label}", variable=var_adj).pack(anchor="w")
 
         btns = ctk.CTkFrame(cont, fg_color="transparent"); btns.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(10,0))
@@ -1068,7 +1311,7 @@ def construir_reportes(frame_padre):
 
     # -------- Lógica de búsqueda y render --------
     def buscar_reportes():
-        nonlocal registros_por_dia, label_estado, label_datos, label_total, label_total_semana, label_pactadas, label_completadas, label_resumen
+        nonlocal registros_por_dia, label_estado, label_datos, label_total, label_total_semana, label_pactadas, label_completadas, label_resumen, frame_tabla
         rut = entry_rut.get().strip()
         fecha_desde = entry_desde.get().strip()
         fecha_hasta = entry_hasta.get().strip()
@@ -1159,6 +1402,7 @@ def construir_reportes(frame_padre):
                 }
             dia += timedelta(days=1)
 
+        # Autocompletar "Cometido" sin salida guardada
         for fecha, info in registros_por_dia.items():
             obs_txt = (info.get("obs_ingreso") or "") + " " + (info.get("obs_salida") or "") + " " + (info.get("motivo") or "")
             obs_txt = obs_txt.lower()
@@ -1188,9 +1432,20 @@ def construir_reportes(frame_padre):
                     info["obs_salida"] = "Salida autocompletada por Cometido"
 
         if registros_por_dia:
-            encabezados = ["Fecha", "Ingreso", "Salida", "Trabajado", "Obs. Ingreso", "Obs. Salida"]
+            # ENCABEZADOS con horas esperadas
+            encabezados = ["Fecha", "Ingreso", "Esp. Ing.", "Salida", "Esp. Sal.", "Trabajado", "Obs. Ingreso", "Obs. Salida"]
             for col, texto in enumerate(encabezados):
-                ctk.CTkLabel(frame_tabla, text=texto, font=("Arial", 13, "bold")).grid(row=0, column=col, padx=10, pady=4)
+                ctk.CTkLabel(frame_tabla, text=texto, font=("Arial", 13, "bold")).grid(row=0, column=col, padx=8, pady=4, sticky="nsew")
+
+            # Anchos / wrap de observaciones
+            frame_tabla.grid_columnconfigure(0, weight=0, minsize=90)   # fecha
+            frame_tabla.grid_columnconfigure(1, weight=0, minsize=80)   # ingreso
+            frame_tabla.grid_columnconfigure(2, weight=0, minsize=80)   # esp. ing
+            frame_tabla.grid_columnconfigure(3, weight=0, minsize=80)   # salida
+            frame_tabla.grid_columnconfigure(4, weight=0, minsize=80)   # esp. sal
+            frame_tabla.grid_columnconfigure(5, weight=0, minsize=110)  # trabajado
+            frame_tabla.grid_columnconfigure(6, weight=1, minsize=250)  # obs ingreso
+            frame_tabla.grid_columnconfigure(7, weight=1, minsize=250)  # obs salida
 
             fila = 1
             total_minutos = 0
@@ -1203,6 +1458,16 @@ def construir_reportes(frame_padre):
                 es_fer = registros_por_dia[fecha].get("es_feriado", False)
                 trabajado = registros_por_dia[fecha].get("trabajado", "0h 0min")
 
+                # obtener horas esperadas
+                try:
+                    fecha_dt = datetime.strptime(fecha, "%Y-%m-%d")
+                except Exception:
+                    fecha_dt = None
+                he, hs = obtener_horario_del_dia(rut, fecha_dt if fecha_dt else fecha)
+                esp_ing = he or "—"
+                esp_sal = hs or "—"
+
+                # Calcular trabajado efectivo si corresponde
                 if not es_admin and ingreso not in (None, "--") and salida not in (None, "--"):
                     t1 = parse_hora_flexible(ingreso)
                     t2 = parse_hora_flexible(salida)
@@ -1221,23 +1486,62 @@ def construir_reportes(frame_padre):
                         trabajado = registros_por_dia[fecha].get("trabajado", "0h 0min")
                         registros_por_dia[fecha]["trabajado"] = trabajado
 
+                # colores por validación
+                ingreso_color = None
+                salida_color = None
+                try:
+                    if ingreso and ingreso != "--" and esp_ing and esp_ing != "—":
+                        ti = parse_hora_flexible(ingreso); te = parse_hora_flexible(esp_ing)
+                        if ti and te:
+                            if ti > (te + timedelta(minutes=TOLERANCIA_MIN)):
+                                ingreso_color = "red"
+                            else:
+                                ingreso_color = "green"
+                except Exception:
+                    pass
+                try:
+                    if salida and salida != "--" and esp_sal and esp_sal != "—":
+                        ts = parse_hora_flexible(salida); to = parse_hora_flexible(esp_sal)
+                        if ts and to:
+                            if ts < (to - timedelta(minutes=SALIDA_TOLERANCIA_MIN)):
+                                salida_color = "red"
+                            else:
+                                salida_color = "green"
+                except Exception:
+                    pass
+
+                # color fila por tipos especiales
                 fecha_legible = datetime.strptime(fecha, "%Y-%m-%d").strftime("%d/%m/%Y")
-                fila_datos = [fecha_legible, ingreso or "--", salida or "--", trabajado, obs_ingreso or "", obs_salida or ""]
-                for col, val in enumerate(fila_datos):
+                valores = [fecha_legible, ingreso or "--", esp_ing, salida or "--", esp_sal, trabajado, obs_ingreso or "", obs_salida or ""]
+
+                for col, val in enumerate(valores):
                     color = None
                     if es_fer:
                         color = "#00aaff"
                     elif es_admin:
                         color = "#00bfff"
-                    elif col == 3 and trabajado != "0h 0min":
-                        color = "green"
-                    elif col == 3 and trabajado == "0h 0min":
-                        color = "orange"
-
-                    if color:
-                        ctk.CTkLabel(frame_tabla, text=val, text_color=color).grid(row=fila, column=col, padx=10, pady=2)
                     else:
-                        ctk.CTkLabel(frame_tabla, text=val).grid(row=fila, column=col, padx=10, pady=2)
+                        if col == 1 and ingreso_color:
+                            color = ingreso_color
+                        if col == 3 and salida_color:
+                            color = salida_color
+                        if col == 5 and trabajado != "0h 0min":
+                            color = color or "green"
+
+                    # wrap en observaciones (col 6 y 7)
+                    wrap_len = 280 if col in (6, 7) else 0
+                    kwargs = {}
+                    if wrap_len:
+                        kwargs["wraplength"] = wrap_len
+                        kwargs["justify"] = "left"
+                        kwargs["anchor"] = "w"
+                        kwargs["width"] = 1  # CTk ignora width en grid, wraplength manda
+                    lbl = ctk.CTkLabel(frame_tabla, text=val)
+                    if color:
+                        lbl.configure(text_color=color)
+                    if wrap_len:
+                        lbl.configure(wraplength=wrap_len, justify="left")
+                    lbl.grid(row=fila, column=col, padx=8, pady=2, sticky="nsew")
                 fila += 1
 
             h_tot, m_tot = divmod(int(total_minutos), 60)
@@ -1279,7 +1583,6 @@ def construir_reportes(frame_padre):
             resumen = calcular_estadisticas_periodo(rut, registros_por_dia, desde_dt, hasta_dt)
             h_all, m_all = divmod(int(resumen["total_min_trabajados"]), 60)
 
-            # NUEVO: Admin año + Extras año en la UI
             anio_actual = datetime.now().year
             limite_admin = obtener_cupo_admin_para_rut(rut) or 6
             admin_anio = contar_admin_anio(rut, anio_actual)
@@ -1341,113 +1644,87 @@ def construir_reportes(frame_padre):
             abrir=True
         )
 
-    # === INTERFAZ ===
-    frame = ctk.CTkFrame(frame_padre)
-    frame.pack(fill="both", expand=True)
-
-    ctk.CTkLabel(frame, text="Reportes por Funcionario", font=("Arial", 16)).pack(pady=10)
-
-    # === BUSCADOR POR NOMBRE ===
-    lista_nombres = []
-    dict_nombre_rut = {}
+    # ---------------- UI ----------------
+    frame = ctk.CTkFrame(frame_padre, corner_radius=12)
+    frame.grid(row=0, column=0, sticky="nsew")
     try:
-        conexion = sqlite3.connect("reloj_control.db")
-        cursor = conexion.cursor()
-        cursor.execute("SELECT rut, nombre, apellido FROM trabajadores")
-        for rut_db, nombre_db, apellido_db in cursor.fetchall():
-            nombre_completo = f"{nombre_db} {apellido_db}"
-            lista_nombres.append(nombre_completo)
-            dict_nombre_rut[nombre_completo] = rut_db
-        conexion.close()
-    except Exception as e:
-        print(f"Error al cargar funcionarios: {e}")
+        frame_padre.grid_rowconfigure(0, weight=1)
+        frame_padre.grid_columnconfigure(0, weight=1)
+        frame.grid_rowconfigure(3, weight=1)   # tabla
+        frame.grid_columnconfigure(0, weight=1)
+    except Exception:
+        pass
 
-    def actualizar_opciones(valor_actual):
-        filtro = (valor_actual or "").lower()
-        coincidencias = [n for n in lista_nombres if filtro in n.lower()]
-        if not coincidencias:
-            coincidencias = ["No hay coincidencias"]
-        combo_funcionarios.configure(values=coincidencias)
-        combo_funcionarios.set(valor_actual)
-        if valor_actual not in dict_nombre_rut:
-            entry_rut.delete(0, "end")
+    # Filtros
+    filtros = ctk.CTkFrame(frame, fg_color="transparent")
+    filtros.grid(row=0, column=0, sticky="ew", padx=10, pady=(10,6))
+    filtros.grid_columnconfigure(7, weight=1)
 
-    def seleccionar_funcionario(valor):
-        if valor == "No hay coincidencias":
-            return
-        rut_sel = dict_nombre_rut.get(valor, "")
-        entry_rut.delete(0, "end")
-        entry_rut.insert(0, rut_sel)
+    ctk.CTkLabel(filtros, text="RUT:").grid(row=0, column=0, padx=(0,6))
+    entry_rut = ctk.CTkEntry(filtros, width=180, placeholder_text="11.111.111-1")
+    entry_rut.grid(row=0, column=1, padx=(0,12))
 
-    combo_frame = ctk.CTkFrame(frame, fg_color="transparent")
-    combo_frame.pack(pady=5)
+    ctk.CTkLabel(filtros, text="Desde:").grid(row=0, column=2, padx=(0,6))
+    entry_desde = ctk.CTkEntry(filtros, width=120, placeholder_text="dd/mm/aaaa")
+    entry_desde.grid(row=0, column=3)
+    ctk.CTkButton(filtros, text="📅", width=36, command=lambda: seleccionar_fecha(entry_desde)).grid(row=0, column=4, padx=(6,12))
 
-    def al_hacer_click(event):
-        if combo_funcionarios.get() == "Buscar Usuario por nombre":
-            combo_funcionarios.set("")
+    ctk.CTkLabel(filtros, text="Hasta:").grid(row=0, column=5, padx=(0,6))
+    entry_hasta = ctk.CTkEntry(filtros, width=120, placeholder_text="dd/mm/aaaa")
+    entry_hasta.grid(row=0, column=6)
+    ctk.CTkButton(filtros, text="📅", width=36, command=lambda: seleccionar_fecha(entry_hasta)).grid(row=0, column=7, padx=(6,12))
 
-    combo_funcionarios = ctk.CTkComboBox(
-        combo_frame,
-        values=["Buscar Usuario por nombre"],
-        width=400,
-        height=35,
-        font=("Arial", 14),
-        corner_radius=8,
-        command=seleccionar_funcionario
-    )
-    combo_funcionarios.set("Buscar Usuario por nombre")
-    combo_funcionarios.pack(side="left", padx=(0, 10))
-    combo_funcionarios.bind("<FocusIn>", al_hacer_click)
-    combo_funcionarios.bind("<KeyRelease>", lambda event: actualizar_opciones(combo_funcionarios.get()))
-    combo_funcionarios.bind("<Return>", lambda event: actualizar_opciones(combo_funcionarios.get()))
+    ctk.CTkButton(filtros, text="Buscar Reporte", fg_color="#0ea5e9", command=buscar_reportes).grid(row=0, column=8, padx=(0,8))
+    ctk.CTkButton(filtros, text="Exportar PDF", fg_color="#22c55e", command=exportar_pdf_click).grid(row=0, column=9, padx=(0,8))
+    ctk.CTkButton(filtros, text="Enviar por correo", fg_color="#6366f1", command=abrir_envio_correo).grid(row=0, column=10)
 
-    def limpiar_combobox():
-        combo_funcionarios.set("Buscar Usuario por nombre")
-        combo_funcionarios.configure(values=lista_nombres)
-        entry_rut.delete(0, 'end')
+    # Datos trabajador + estado
+    header = ctk.CTkFrame(frame, fg_color="transparent")
+    header.grid(row=1, column=0, sticky="ew", padx=10)
+    header.grid_columnconfigure(0, weight=1)
+    header.grid_columnconfigure(1, weight=1)
 
-    ctk.CTkButton(combo_frame, text="Limpiar", width=80, height=35, command=limpiar_combobox).pack(side="left")
+    label_datos = ctk.CTkLabel(header, text="RUT / Nombre / Profesión", anchor="w", justify="left")
+    label_datos.grid(row=0, column=0, sticky="w")
 
-    entry_rut = ctk.CTkEntry(frame, placeholder_text="RUT (Ej: 12345678-9)")
-    entry_rut.pack(pady=5)
-    entry_rut.bind("<Return>", lambda event: buscar_reportes())
+    label_estado = ctk.CTkLabel(header, text="Listo.", anchor="e", justify="right", text_color="#a3a3a3")
+    label_estado.grid(row=0, column=1, sticky="e")
 
-    cont_fecha_desde = ctk.CTkFrame(frame, fg_color="transparent")
-    cont_fecha_desde.pack(pady=2)
-    entry_desde = ctk.CTkEntry(cont_fecha_desde, placeholder_text="Desde (dd/mm/aaaa)", width=200)
-    entry_desde.pack(side="left")
-    ctk.CTkButton(cont_fecha_desde, text="📅", width=40, command=lambda: seleccionar_fecha(entry_desde)).pack(side="left", padx=5)
+    # Resúmenes rápidos
+    res = ctk.CTkFrame(frame, fg_color="transparent")
+    res.grid(row=2, column=0, sticky="ew", padx=10, pady=(6,6))
+    res.grid_columnconfigure((0,1,2,3), weight=1)
 
-    cont_fecha_hasta = ctk.CTkFrame(frame, fg_color="transparent")
-    cont_fecha_hasta.pack(pady=2)
-    entry_hasta = ctk.CTkEntry(cont_fecha_hasta, placeholder_text="Hasta (dd/mm/aaaa)", width=200)
-    entry_hasta.pack(side="left")
-    ctk.CTkButton(cont_fecha_hasta, text="📅", width=40, command=lambda: seleccionar_fecha(entry_hasta)).pack(side="left", padx=5)
+    label_total = ctk.CTkLabel(res, text="Total trabajado en el período (efectivo en tabla): 0h 0min")
+    label_total.grid(row=0, column=0, sticky="w", padx=(0,12))
 
-    ctk.CTkButton(frame, text="Buscar Reporte", command=buscar_reportes).pack(pady=5)
-    ctk.CTkButton(frame, text="Exportar PDF", command=exportar_pdf_click).pack(pady=(5, 2))
-    ctk.CTkButton(frame, text="Enviar por Correo", command=abrir_envio_correo).pack(pady=(2, 5))
+    label_total_semana = ctk.CTkLabel(res, text="Total trabajado en la semana (efectivo): 0h 0min")
+    label_total_semana.grid(row=0, column=1, sticky="w", padx=(0,12))
 
-    label_datos = ctk.CTkLabel(frame, text="RUT: ---\nNombre: ---\nProfesión: ---", font=("Arial", 13), justify="left")
-    label_datos.pack(pady=10)
+    label_pactadas = ctk.CTkLabel(res, text="Carga Horaria (semanal): —")
+    label_pactadas.grid(row=0, column=2, sticky="w", padx=(0,12))
 
-    frame_tabla = ctk.CTkScrollableFrame(frame)
-    frame_tabla.pack(pady=10, fill="both", expand=True)
+    label_completadas = ctk.CTkLabel(res, text="Horas completadas esta semana: 0h 00min")
+    label_completadas.grid(row=0, column=3, sticky="w")
 
-    label_total = ctk.CTkLabel(frame, text="", font=("Arial", 12))
-    label_total.pack(pady=2)
+    # Tabla resultados
+    frame_tabla = ctk.CTkFrame(frame, corner_radius=8)
+    frame_tabla.grid(row=3, column=0, sticky="nsew", padx=10, pady=(4,6))
 
-    label_total_semana = ctk.CTkLabel(frame, text="", font=("Arial", 12))
-    label_total_semana.pack(pady=2)
+    # Resumen general al pie
+    label_resumen = ctk.CTkLabel(frame, text="Resumen (período): —", justify="left", anchor="w")
+    label_resumen.grid(row=4, column=0, sticky="ew", padx=10, pady=(0,10))
 
-    label_pactadas = ctk.CTkLabel(frame, text="", font=("Arial", 12))
-    label_pactadas.pack(pady=2)
+    # Fechas por defecto (mes actual)
+    try:
+        hoy = datetime.today()
+        entry_desde.insert(0, hoy.replace(day=1).strftime("%d/%m/%Y"))
+        fin = (hoy + timedelta(days=45)).replace(day=1) - timedelta(days=1)
+        entry_hasta.insert(0, fin.strftime("%d/%m/%Y"))
+    except Exception:
+        pass
 
-    label_completadas = ctk.CTkLabel(frame, text="", font=("Arial", 12))
-    label_completadas.pack(pady=2)
+    return frame
 
-    label_resumen = ctk.CTkLabel(frame, text="", font=("Arial", 12), justify="left")
-    label_resumen.pack(pady=4)
 
-    label_estado = ctk.CTkLabel(frame, text="")
-    label_estado.pack(pady=10)
+__all__ = ["construir_reportes"]

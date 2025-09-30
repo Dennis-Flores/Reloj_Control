@@ -105,6 +105,10 @@ def _get_flag_salida_anticipada_local():
         return (0, "")
 
 def _hora_salida_oficial_por_horario(rut: str, fecha_iso: str, hora_ingreso_hhmm: str | None) -> str:
+    """
+    DEVUELVE LA SALIDA OFICIAL (FIN DE JORNADA): la ÚLTIMA hora_salida del día para el RUT y día de semana.
+    Ignora colación. Si no hay turnos, retorna '17:30'.
+    """
     con = sqlite3.connect(DB_PATH)
     cur = con.cursor()
     dia = _dia_semana_es(fecha_iso)
@@ -115,22 +119,16 @@ def _hora_salida_oficial_por_horario(rut: str, fecha_iso: str, hora_ingreso_hhmm
     if not turnos:
         return "17:30"
 
-    if hora_ingreso_hhmm:
-        h_ing = parse_hora(hora_ingreso_hhmm[:5])
-        for h_e, h_s in turnos:
-            if not h_e or not h_s:
-                continue
-            h_ini = parse_hora(h_e)
-            h_fin = parse_hora(h_s)
-            if h_fin < h_ini:  # nocturno
-                h_fin = h_fin + timedelta(days=1)
-                if h_ing < h_ini:
-                    h_ing = h_ing + timedelta(days=1)
-            if h_ini <= h_ing <= h_fin:
-                return h_s[:5]
+    salidas_validas = [s for (_e, s) in turnos if s and s.strip()]
+    if not salidas_validas:
+        return "17:30"
 
-    salidas_validas = [s for (_e, s) in turnos if s]
-    return (max(salidas_validas)[:5] if salidas_validas else "17:30")
+    # Elegimos la mayor por hora del día (no contempla nocturnos cruzando medianoche)
+    try:
+        ultima = max(salidas_validas, key=lambda h: parse_hora(h))
+    except Exception:
+        ultima = max(salidas_validas)  # fallback por string
+    return ultima[:5]
 
 # ================== EMERGENCIA: VALIDACIÓN POR RUT + CLAVE ==================
 CLAVE_MAESTRA = "2202225"
@@ -151,28 +149,83 @@ def validar_pass_rut(rut: str, clave: str) -> bool:
         return True
     return clave == _clave_por_rut(rut)
 
+# -------- utilidades de RUT (formateo y validación) --------
+def _rut_limpio(r: str) -> str:
+    # Solo letras/números, sin puntos ni guiones, DV en mayúscula
+    s = "".join(ch for ch in r if ch.isalnum()).upper()
+    return s
+
+def _rut_formatear(r: str) -> str:
+    """
+    Convierte '123456789' -> '12345678-9', '12.345.678-9' -> '12345678-9'.
+    Si no hay longitud suficiente, retorna tal cual.
+    """
+    s = _rut_limpio(r)
+    if len(s) < 2:
+        return r.strip()
+    cuerpo, dv = s[:-1], s[-1]
+    if not cuerpo.isdigit():
+        return r.strip()
+    return f"{cuerpo}-{dv}"
+
+def _rut_valido(r: str) -> bool:
+    """
+    Valida DV por algoritmo Módulo 11. Acepta DV 'K'.
+    """
+    s = _rut_limpio(r)
+    if len(s) < 2 or not s[:-1].isdigit():
+        return False
+    cuerpo, dv = s[:-1], s[-1]
+    suma = 0
+    factor = 2
+    for c in reversed(cuerpo):
+        suma += int(c) * factor
+        factor += 1
+        if factor > 7:
+            factor = 2
+    resto = suma % 11
+    res = 11 - resto
+    dv_calc = '0' if res == 11 else 'K' if res == 10 else str(res)
+    return dv_calc == dv
+
 # ================== VERIFICACIÓN FACIAL ==================
 FACIAL_TOLERANCE = 0.50      # más bajo = más estricto
 DISTANCE_MARGIN  = 0.04
-FRIDAY_FLEX_MINUTES = 30     # margen de “colación” (viernes): salida sin observación dentro de este rango
-LATE_AFTER_EXIT_MINUTES = 30 # Observación solo si la salida real supera (>=) este umbral
+FRIDAY_FLEX_MINUTES = 30     # margen de “colación” (viernes)
+LATE_AFTER_EXIT_MINUTES = 40 # observación si supera la salida final por 40+ min
 
-# ---------- NUEVO: configuración de extras ----------
-EXTRA_MINUTES_THRESHOLD = 30             # umbral para sumar a extras (minutos)
-EXTRA_COUNT_ONLY_ABOVE_THRESHOLD = True  # si True, solo suma si exceso >= umbral; si False, suma todos los minutos > 0
+# ---------- configuración de extras ----------
+EXTRA_MINUTES_THRESHOLD = 30
+EXTRA_COUNT_ONLY_ABOVE_THRESHOLD = True
 
 def _ensure_list_encodings(obj):
     if isinstance(obj, (list, tuple)):
         return list(obj)
     return [obj]
 
+# ===== Loader tolerante a variantes de nombre de archivo =====
 def _load_encodings_for_rut(rut: str):
-    archivo_rostro = os.path.join(ROSTROS_DIR, f"{rut}.pkl")
-    if not os.path.exists(archivo_rostro):
-        return []
-    with open(archivo_rostro, "rb") as f:
-        data = pickle.load(f)
-    return _ensure_list_encodings(data)
+    candidatos = set()
+
+    r_fmt = _rut_formatear(rut)          # 12345678-K
+    r_raw = _rut_limpio(rut)             # 12345678K
+
+    # Variantes comunes con y sin guion, K/k
+    candidatos.update([
+        r_fmt,                            # 12345678-K
+        r_fmt.lower(),                    # 12345678-k
+        r_raw,                            # 12345678K
+        (r_raw[:-1] + "-" + r_raw[-1]) if len(r_raw) >= 2 else r_fmt,          # 12345678-K
+        ((r_raw[:-1] + "-" + r_raw[-1]).lower()) if len(r_raw) >= 2 else r_fmt  # 12345678-k
+    ])
+
+    for base in candidatos:
+        p = os.path.join(ROSTROS_DIR, f"{base}.pkl")
+        if os.path.exists(p):
+            with open(p, "rb") as f:
+                data = pickle.load(f)
+            return _ensure_list_encodings(data)
+    return []
 
 def _load_all_known_encodings():
     encs, ruts = [], []
@@ -327,9 +380,6 @@ def reconocer_rostro_sin_rut():
             continue
 
         restante = max(0, int(duracion - (time.time() - t0)))
-        cv2.putText(frame, f"Tiempo restante: {restante}s", (40, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
-
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         try:
             rostros_en_vivo = face_recognition.face_encodings(rgb)
@@ -339,10 +389,6 @@ def reconocer_rostro_sin_rut():
             break
 
         if rostros_en_vivo:
-            if len(rostros_en_vivo) > 1:
-                cv2.putText(frame, "Por favor, solo 1 persona frente a la camara", (40, 70),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
-
             cand = rostros_en_vivo[0]
             dists = face_recognition.face_distance(known_matrix, cand)
 
@@ -480,7 +526,7 @@ def construir_ingreso_salida(frame_padre):
 
         if rut_sugerido:
             try:
-                entry_rut_em.insert(0, rut_sugerido)
+                entry_rut_em.insert(0, _rut_formatear(rut_sugerido))
                 entry_pass_em.focus_set()
             except Exception:
                 pass
@@ -489,14 +535,17 @@ def construir_ingreso_salida(frame_padre):
         botones.pack(fill="x", pady=8)
 
         def _confirmar():
-            rut_i = entry_rut_em.get().strip()
-            pass_i = entry_pass_em.get().strip()
-            if not rut_i or not pass_i:
+            rut_i_raw = entry_rut_em.get().strip()
+            rut_i = _rut_formatear(rut_i_raw)  # ← formateo automático
+            if not rut_i or not entry_pass_em.get().strip():
                 tk.messagebox.showwarning("Campo vacío", "Debes ingresar RUT y clave.")
                 return
-            if not validar_pass_rut(rut_i, pass_i):
+            if not validar_pass_rut(rut_i, entry_pass_em.get().strip()):
                 tk.messagebox.showerror("Acceso denegado", "RUT o clave inválidos.")
                 return
+            # Validación suave del DV
+            if not _rut_valido(rut_i):
+                tk.messagebox.showwarning("RUT", "El RUT ingresado no supera la validación de DV. Revisa si es correcto.")
 
             try:
                 win.grab_release()
@@ -505,7 +554,7 @@ def construir_ingreso_salida(frame_padre):
             win.destroy()
 
             entry_rut.delete(0, tk.END)
-            entry_rut.insert(0, rut_i)
+            entry_rut.insert(0, rut_i)  # ← ya formateado
             label_estado.configure(text="✅ Acceso por clave de emergencia.", text_color="yellow")
             label_hora_registro.configure(text="")
             cargar_info_usuario(rut_i, por_verificacion=True)
@@ -578,7 +627,9 @@ def construir_ingreso_salida(frame_padre):
 
     # --------- función para registrar (ingreso/salida) ---------
     def registrar(tipo):
-        rut = entry_rut.get().strip()
+        # Normalizar RUT leído del entry para dejar BD consistente
+        rut = _rut_formatear(entry_rut.get().strip())
+
         nombre = label_nombre.cget("text").replace("Nombre: ", "")
         fecha_iso = _hoy_iso()
         hora_actual = datetime.now().strftime('%H:%M:%S')
@@ -727,11 +778,9 @@ def construir_ingreso_salida(frame_padre):
                     conexion.commit()
                 conexion.close()
 
-                # ---- NUEVO: sumar minutos extra del mes si corresponde ----
-                # No se suma si se usó hora oficial (viernes colación) o panel de salida.
+                # ---- SUMA DE EXTRAS (si corresponde) ----
                 if not usar_hora_oficial_salida:
                     try:
-                        # obtener hora ingreso para resolver bloque correcto
                         con2 = sqlite3.connect(DB_PATH)
                         cur2 = con2.cursor()
                         cur2.execute("SELECT hora_ingreso FROM registros WHERE rut=? AND DATE(fecha)=DATE('now')", (rut,))
@@ -739,13 +788,11 @@ def construir_ingreso_salida(frame_padre):
                         con2.close()
                         hora_ingreso_hhmm = row[0] if row and row[0] else None
                         hora_oficial_str = _hora_salida_oficial_por_horario(rut, fecha_iso, hora_ingreso_hhmm)
-                        # Calcular delta (minutos) solo si hay hora oficial válida
                         if hora_oficial_str:
                             base = datetime.now().date()
                             t_act = datetime.combine(base, hora_actual_dt.time())
                             t_ofi_time = parse_hora(hora_oficial_str)
                             t_ofi = datetime.combine(base, t_ofi_time.time())
-                            # Nota: si el turno es nocturno, este cálculo puede no aplicar. Casos estándar: mismo día.
                             exceso_min = int(max(0, (t_act - t_ofi).total_seconds() // 60))
                             if EXTRA_COUNT_ONLY_ABOVE_THRESHOLD:
                                 exceso_contable = exceso_min if exceso_min >= EXTRA_MINUTES_THRESHOLD else 0
@@ -815,6 +862,7 @@ def construir_ingreso_salida(frame_padre):
                         bloques_validos = [s for _, s in bloques if s and s.strip()]
                         if not bloques_validos:
                             raise ValueError("No se encontró una hora de salida válida.")
+                        # Hora final pactada del día (fin de jornada)
                         ultima_salida_str = max(bloques_validos, key=lambda h: parse_hora(h))
                         ultima_salida_dt = parse_hora(ultima_salida_str)
 
@@ -827,11 +875,15 @@ def construir_ingreso_salida(frame_padre):
                         # ------------------------------------
 
                         if hora_actual_dt < ultima_salida_dt:
-                            # Salida antes de la pactada → sin observación (y no suma extras)
-                            registrar_final()
-                            return
+                            # Salida ANTES de la pactada → pedir observación
+                            mensaje_motivo = (
+                                f"⚠️ Vas a salir antes de la hora pactada ({ultima_salida_dt.strftime('%H:%M')}).\n"
+                                f"🕒 Hora actual: {hora_actual_dt.strftime('%H:%M')}.\n"
+                                f"✍️ Por favor, indica el motivo:"
+                            )
+                            requiere_observacion = True
                         else:
-                            # Salida después de pactada: observación sólo si excede el umbral
+                            # Salida DESPUÉS de la pactada: observación solo si supera umbral (40 min)
                             delta_seg = (hora_actual_dt - ultima_salida_dt).total_seconds()
                             delta_min = int(delta_seg // 60)
                             if delta_min >= LATE_AFTER_EXIT_MINUTES:
@@ -846,7 +898,7 @@ def construir_ingreso_salida(frame_padre):
                                 )
                                 requiere_observacion = True
                             else:
-                                # Dentro del umbral → registro directo (sí suma extras si config lo permite)
+                                # Entre hora pactada y +40 min → registro directo
                                 registrar_final()
                                 return
 
@@ -944,15 +996,34 @@ def construir_ingreso_salida(frame_padre):
         else:
             registrar_final()
 
+    # ---- Wrapper para forzar uso del RUT canónico en botones ----
+    def registrar_con_rut(rut_param, tipo):
+        entry_rut.delete(0, tk.END)
+        entry_rut.insert(0, _rut_formatear(rut_param))
+        registrar(tipo)
+
     def cargar_info_usuario(rut, por_verificacion=False):
+        # ---- Reset de estado para evitar arrastres de mensajes previos ----
+        label_estado.configure(text="", text_color="white")
+
         conexion = sqlite3.connect(DB_PATH)
         cursor = conexion.cursor()
-        cursor.execute("SELECT nombre, apellido, profesion, cumpleanos FROM trabajadores WHERE rut = ?", (rut,))
+
+        # Comparar por RUT "limpio" (sin puntos/guion y DV mayúscula)
+        rut_fmt = _rut_formatear(rut)
+        rut_raw = _rut_limpio(rut_fmt)  # p.ej. 10063936K
+        cursor.execute("""
+            SELECT nombre, apellido, profesion, cumpleanos, rut
+            FROM trabajadores
+            WHERE REPLACE(REPLACE(UPPER(rut),'.',''),'-','') = ?
+        """, (rut_raw,))
         resultado = cursor.fetchone()
 
         if resultado:
             nombre_completo = f"{resultado[0]} {resultado[1]}"
             profesion = resultado[2]
+            rut_db = _rut_formatear(resultado[4])  # canónico desde BD
+
             label_nombre.configure(text=f"Nombre: {nombre_completo}")
             label_profesion.configure(text=f"Profesión: {profesion}")
             label_fecha.configure(text=f"Fecha: {datetime.now().strftime('%d/%m/%Y')}")
@@ -961,16 +1032,19 @@ def construir_ingreso_salida(frame_padre):
             cumpleanos = resultado[3] if resultado[3] else ""
             hoy = datetime.now().strftime('%d/%m')
             if cumpleanos and hoy == cumpleanos[:5]:
-                label_estado.configure(text=f"🎂 ¡Hoy es el cumpleaños de {resultado[0]}! 🎉", text_color="yellow")
+                label_estado.configure(
+                    text=f"🎂 ¡Hoy es el cumpleaños de {resultado[0]}! 🎉\nPuedes registrar tu ingreso o salida.",
+                    text_color="yellow"
+                )
             else:
                 label_hora_registro.configure(text="")
-                actualizar_estado_botones(rut, por_reconocimiento=por_verificacion)
 
-            boton_ingreso.configure(command=None)
-            boton_ingreso.configure(command=lambda: registrar("ingreso"))
+            # Mostrar/ocultar botones SIEMPRE, usando rut_db
+            actualizar_estado_botones(rut_db, por_reconocimiento=por_verificacion)
 
-            boton_salida.configure(command=None)
-            boton_salida.configure(command=lambda: registrar("salida"))
+            # Botones usan el RUT canónico
+            boton_ingreso.configure(command=lambda: registrar_con_rut(rut_db, "ingreso"))
+            boton_salida.configure(command=lambda: registrar_con_rut(rut_db, "salida"))
         else:
             label_nombre.configure(text="Nombre: ---")
             label_profesion.configure(text="Profesión: ---")
@@ -982,7 +1056,21 @@ def construir_ingreso_salida(frame_padre):
             boton_salida.pack_forget()
         conexion.close()
 
+    # -------- formateo automático del RUT en UI --------
+    def _formatear_entry_rut():
+        raw = entry_rut.get().strip()
+        if not raw:
+            return
+        fmt = _rut_formatear(raw)
+        # Validación suave: no bloquea, solo informa si DV no cuadra
+        if len(_rut_limpio(raw)) >= 2 and not _rut_valido(fmt):
+            label_estado.configure(text="ℹ️ Revisa el DV del RUT (validación no coincide).", text_color="orange")
+        entry_rut.delete(0, tk.END)
+        entry_rut.insert(0, fmt)
+
     def buscar_automatico():
+        # Formatear antes de usar
+        _formatear_entry_rut()
         rut = entry_rut.get().strip()
         if not rut:
             label_estado.configure(text="🔍 Buscando rostro...", text_color="gray")
@@ -990,8 +1078,8 @@ def construir_ingreso_salida(frame_padre):
             reconocer_rostro_async(
                 callback_exito=lambda rut_detectado: [
                     entry_rut.delete(0, tk.END),
-                    entry_rut.insert(0, rut_detectado),
-                    cargar_info_usuario(rut_detectado, por_verificacion=True)
+                    entry_rut.insert(0, _rut_formatear(rut_detectado)),
+                    cargar_info_usuario(_rut_formatear(rut_detectado), por_verificacion=True)
                 ],
                 callback_error=lambda: pedir_emergencia(rut_sugerido="", mensaje="❌ No se pudo identificar el rostro. Usa clave de emergencia:")
             )
@@ -1018,6 +1106,11 @@ def construir_ingreso_salida(frame_padre):
     entry_rut = ctk.CTkEntry(frame, placeholder_text="Ej: 12345678-9")
     entry_rut.pack(pady=5)
     entry_rut.bind("<Return>", lambda event: buscar_automatico())
+    # Formateo automático al salir del campo
+    try:
+        entry_rut.bind("<FocusOut>", lambda e: _formatear_entry_rut())
+    except Exception:
+        pass
 
     ctk.CTkButton(frame, text="Buscar", command=buscar_automatico).pack(pady=5)
     ctk.CTkButton(frame, text="Limpiar", command=limpiar_campos_btn).pack(pady=5)

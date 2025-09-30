@@ -3,7 +3,7 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_dynamic_libs
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('assets', 'assets'), ('face_recognition_models', 'face_recognition_models'), ('rostros', 'rostros'), ('salidas_solicitudes', 'salidas_solicitudes')]
+datas = [('C:\\Users\\robot\\Proyectos\\Reloj_Control\\assets', 'assets'), ('C:\\Users\\robot\\Proyectos\\Reloj_Control\\face_recognition_models', 'face_recognition_models'), ('C:\\Users\\robot\\Proyectos\\Reloj_Control\\rostros', 'rostros'), ('C:\\Users\\robot\\Proyectos\\Reloj_Control\\salidas_solicitudes', 'salidas_solicitudes')]
 binaries = []
 hiddenimports = ['pkg_resources', 'asistencia_funcionarios', 'asistencia_diaria']
 datas += collect_data_files('face_recognition_models')
@@ -27,7 +27,7 @@ tmp_ret = collect_all('numpy')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('openpyxl')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('XlsxWriter')
+tmp_ret = collect_all('xlsxwriter')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 tmp_ret = collect_all('reportlab')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]

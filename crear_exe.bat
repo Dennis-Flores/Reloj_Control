@@ -2,7 +2,7 @@
 setlocal ENABLEDELAYEDEXPANSION
 title Build BioAccess (Debug/Console)
 
-set "NAME=BioAccess_Debug"
+set "NAME=BioAccess"
 set "PY=.\.venv\Scripts\python.exe"
 if not exist ".\.venv\Scripts\python.exe" (
   echo [!] No se encontro .venv\Scripts\python.exe. Usare 'python' del sistema.
@@ -26,7 +26,7 @@ echo === ADD_DATA: !ADD_DATA!
   --noconfirm ^
   --clean ^
   --name "%NAME%" ^
-  --console ^
+  --windowed ^
   --icon assets\bioaccess.ico ^
   --hidden-import=pkg_resources ^
   --hidden-import=asistencia_funcionarios ^

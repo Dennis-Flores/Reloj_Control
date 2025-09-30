@@ -1,10 +1,13 @@
 import os
+import sys
 import sqlite3
 from datetime import datetime, timedelta
 import tkinter as tk
 from tkinter import messagebox
 import customtkinter as ctk
 from tkcalendar import Calendar
+import subprocess
+import traceback
 
 # ===== PDF =====
 try:
@@ -22,17 +25,61 @@ except Exception:
 import smtplib
 from email.message import EmailMessage
 import mimetypes
-import traceback
-import sys
-import subprocess
 
-# Config SMTP (igual que otros informes)
+# ======= SMTP (coherente con otros módulos) =======
 SMTP_HOST = "mail.bioaccess.cl"
 SMTP_PORT = 465
 SMTP_USER = "documentos_bd@bioaccess.cl"
 SMTP_PASS = "documentos@2025"
 USAR_SMTP = True
 
+# ========= Helpers comunes para CONSISTENCIA =========
+def obtener_cupo_admin_para_rut(rut: str) -> int | None:
+    """
+    Lee cupo anual desde parametros_trabajador(rut, 'dias_admin_cupo').
+    Retorna int o None si no está configurado.
+    """
+    try:
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        cur.execute("""
+            SELECT valor FROM parametros_trabajador
+            WHERE rut=? AND clave='dias_admin_cupo'
+        """, (rut,))
+        row = cur.fetchone()
+        con.close()
+        if row and row[0] is not None:
+            return int(row[0])
+    except Exception:
+        pass
+    return None
+
+def contar_admin_anio(rut: str, anio: int | None = None) -> int:
+    """
+    Cuenta días administrativos usados en el año (tabla dias_libres).
+    Acepta 'Día Administrativo' exacto o variantes (case-insensitive).
+    """
+    try:
+        if anio is None:
+            anio = datetime.now().year
+        con = sqlite3.connect("reloj_control.db")
+        cur = con.cursor()
+        cur.execute("""
+            SELECT COUNT(*)
+            FROM dias_libres
+            WHERE rut=?
+              AND strftime('%Y', fecha)=?
+              AND (
+                    motivo='Día Administrativo'
+                 OR lower(motivo) LIKE '%dia administrativo%'
+                 OR lower(motivo) LIKE '%día administrativo%'
+              )
+        """, (rut, str(anio)))
+        n = cur.fetchone()[0] or 0
+        con.close()
+        return int(n)
+    except Exception:
+        return 0
 
 # ----------------------- Utilidades varias -----------------------
 def _downloads_dir():
@@ -67,23 +114,23 @@ def _ruta_unica(path: str) -> str:
 
 def _categoria_motivo(motivo: str) -> str:
     s = (motivo or "").lower()
-    if "día administrativo" in s:
+    if "día administrativo" in s or "dia administrativo" in s:
         return "Día Administrativo"
-    if "matrimonio" in s or "unión civil" in s:
+    if "matrimonio" in s or "unión civil" in s or "union civil" in s:
         return "Matrimonio/AUC"
-    if "defunción" in s:
-        if "hijo en gestación" in s:
+    if "defunción" in s or "defuncion" in s:
+        if "hijo en gestación" in s or "hijo en gestacion" in s:
             return "Defunción: Hijo en gestación"
         if "hijo" in s:
             return "Defunción: Hijo"
-        if "cónyuge" in s or "conviviente civil" in s:
+        if "cónyuge" in s or "conyuge" in s or "conviviente civil" in s:
             return "Defunción: Cónyuge/Conviviente"
         if "padre" in s or "madre" in s or "hermano" in s:
             return "Defunción: Padre/Madre/Hermano(a)"
         return "Defunción: Otro"
     if "nacimiento paternal" in s:
         return "Nacimiento Paternal"
-    if "alimentación" in s:
+    if "alimentación" in s or "alimentacion" in s:
         return "Permiso de Alimentación"
     if "sin goce" in s:
         return "Permiso sin Goce de Sueldo"
@@ -105,6 +152,7 @@ def _emails_para_rut(rut: str):
     except Exception:
         return []
 
+# ----------------------- Correo -----------------------
 def _send_pdf_email(to_list, cc_list, subject, text_body, html_body, attach_path) -> bool:
     if not USAR_SMTP:
         messagebox.showinfo("Correo (simulado)", f"Para: {', '.join(to_list)}\nCC: {', '.join(cc_list)}\nAsunto: {subject}")
@@ -136,10 +184,19 @@ def _send_pdf_email(to_list, cc_list, subject, text_body, html_body, attach_path
         messagebox.showerror("Correo", f"No fue posible enviar el correo:\n{e}")
         return False
 
-def _html_email_permisos(period_text: str, nombre: str, rut: str, total_reg: int) -> str:
+def _html_email_permisos(period_text: str, nombre: str, rut: str, total_reg: int,
+                         admin_usados_anio: int | None, admin_rest_anio: int | None, anio_ref: int):
     PAGE_BG = "#f3f4f6"; CARD_BG = "#ffffff"; TEXT = "#111827"
     MUTED = "#6b7280"; BORDER = "#e5e7eb"; ACCENT = "#0b5ea8"
     gen = datetime.now().strftime("%d-%m-%Y %H:%M")
+    chip_admin = ""
+    if admin_usados_anio is not None:
+        rest_txt = "—" if admin_rest_anio is None else str(admin_rest_anio)
+        chip_admin = f"""
+          <span style="display:inline-block;background:#eaf7ea;border:1px solid #b6e2b6;color:#166534;border-radius:8px;padding:4px 10px;font-size:12px;margin-left:6px">
+            Adm. {anio_ref}: {admin_usados_anio} (restantes: {rest_txt})
+          </span>
+        """
     return f"""<!doctype html>
 <html lang="es"><meta charset="utf-8">
 <body style="margin:0;padding:24px;background:{PAGE_BG};color:{TEXT};font-family:Arial,Helvetica,sans-serif">
@@ -159,19 +216,19 @@ def _html_email_permisos(period_text: str, nombre: str, rut: str, total_reg: int
       <span style="display:inline-block;background:{ACCENT};color:#fff;border-radius:8px;padding:4px 10px;font-size:12px">
         RUT: {rut}
       </span>
+      {chip_admin}
     </div>
     <p style="margin:0;color:{MUTED};font-size:12px">Registros incluidos: {total_reg}. Generado el {gen}.</p>
   </div>
 </body>
 </html>"""
 
-
 # ----------------------- PDF builder -----------------------
 def _build_pdf_permisos(path_pdf, rut, nombre_funcionario, filas, period_text, resumen_info):
     """
     filas: lista [(id, fecha_iso, motivo), ...] ordenadas por fecha
     resumen_info: dict con llaves:
-        total, admin_usados, admin_limite, admin_restantes, licencias, extras, categorias (dict)
+        total, admin_usados_anio, admin_limite, admin_restantes_anio, licencias, extras, categorias (dict), anio_ref
     """
     if not PDF_OK:
         raise RuntimeError("ReportLab no está instalado.")
@@ -222,16 +279,16 @@ def _build_pdf_permisos(path_pdf, rut, nombre_funcionario, filas, period_text, r
     ))
     elems.append(Spacer(0, 8))
 
-    # Resumen compacto (panel)
+    # Resumen compacto (panel) — CONSISTENTE con el otro informe
     res = resumen_info
     res_tbl = Table([
-        ["Total registros", str(res["total"])],
-        ["Días administrativos (usados)", str(res["admin_usados"])],
-        ["Límite anual", str(res["admin_limite"])],
-        ["Restantes", str(res["admin_restantes"])],
-        ["Permisos extras", str(res["extras"])],
+        ["Total registros del período", str(res["total"])],
+        [f"Días administrativos (usados en {res['anio_ref']})", str(res["admin_usados_anio"])],
+        [f"Límite anual", str(res["admin_limite"])],
+        [f"Restantes año {res['anio_ref']}", "—" if res["admin_restantes_anio"] is None else str(res["admin_restantes_anio"])],
+        ["Permisos extras (no admin)", str(res["extras"])],
         ["Licencias médicas", str(res["licencias"])],
-    ], colWidths=[8.5*cm, 3.0*cm])
+    ], colWidths=[12.5*cm, 3.0*cm])
     res_tbl.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#D9E1F2")),
         ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
@@ -252,7 +309,6 @@ def _build_pdf_permisos(path_pdf, rut, nombre_funcionario, filas, period_text, r
         fecha_leg = datetime.strptime(fecha_iso, "%Y-%m-%d").strftime("%d/%m/%Y")
         data.append([str(id_), fecha_leg, Paragraph(motivo or "—", obs)])
 
-    # 27 cm útiles aprox.
     col_w = [2.0*cm, 3.0*cm, 22.0*cm]
     tbl = Table(data, colWidths=col_w, repeatRows=1)
     tbl.setStyle(TableStyle([
@@ -297,7 +353,6 @@ def _build_pdf_permisos(path_pdf, rut, nombre_funcionario, filas, period_text, r
         leftMargin=36, rightMargin=36, topMargin=36, bottomMargin=36
     )
     doc.build(elems)
-
 
 # ----------------------- Construcción de UI -----------------------
 def construir_dia_administrativo(frame_padre):
@@ -355,31 +410,31 @@ def construir_dia_administrativo(frame_padre):
         for _id, _f, mot in filas:
             motivos[mot or ""] += 1
             cats[_categoria_motivo(mot)] += 1
-        admin_usados = cats.get("Día Administrativo", 0)
+
+        # Conteo por categorías
         lic = cats.get("Licencia Médica", 0)
         total = sum(motivos.values())
-        extras = total - admin_usados
-        # límite anual = 6 (regla local)
-        anio_actual = datetime.now().year
-        try:
-            con = sqlite3.connect("reloj_control.db"); cur = con.cursor()
-            cur.execute("""
-                SELECT COUNT(*) FROM dias_libres 
-                WHERE rut = ? AND strftime('%Y', fecha) = ? AND motivo = 'Día Administrativo'
-            """, (rut, str(anio_actual)))
-            admin_year = cur.fetchone()[0]
-            con.close()
-        except Exception:
-            admin_year = admin_usados
-        admin_rest = max(0, 6 - admin_year)
+        admin_periodo = cats.get("Día Administrativo", 0)  # por si te interesa mostrarlo aparte
+
+        # ===== Consistencia anual =====
+        anio_ref = datetime.now().year
+        cupo = obtener_cupo_admin_para_rut(rut)
+        if cupo is None:
+            cupo = 6  # default si no hay parámetro configurado
+        admin_usados_anio = contar_admin_anio(rut, anio_ref)
+        admin_rest = max(0, int(cupo) - int(admin_usados_anio))
+
+        extras = total - admin_periodo  # "extras" = todo lo demás distinto a día administrativo
+
         return {
             "total": total,
-            "admin_usados": admin_year,
-            "admin_limite": 6,
-            "admin_restantes": admin_rest,
-            "licencias": lic,
-            "extras": extras,
+            "admin_usados_anio": int(admin_usados_anio),
+            "admin_limite": int(cupo) if cupo is not None else None,
+            "admin_restantes_anio": int(admin_rest) if cupo is not None else None,
+            "licencias": int(lic),
+            "extras": int(extras),
             "categorias": dict(cats),
+            "anio_ref": int(anio_ref),
         }
 
     def exportar_informe():
@@ -522,9 +577,16 @@ def construir_dia_administrativo(frame_padre):
         entry_cc = ctk.CTkEntry(box, width=520, placeholder_text="(opcional) separar por coma")
         entry_cc.grid(row=2, column=1, sticky="w", pady=(0,6))
 
+        # Cabecera con info de admin anuales consistente
+        admin_usados_anio = resumen["admin_usados_anio"]
+        admin_rest_anio   = resumen["admin_restantes_anio"]
+        anio_ref          = resumen["anio_ref"]
         ctk.CTkLabel(
             box,
-            text=f"Periodo: {period_text}   |   Funcionario: {nombre} ({rut})   |   Registros: {len(filas)}",
+            text=(
+                f"Periodo: {period_text}   |   Funcionario: {nombre} ({rut})   |   Registros: {len(filas)}   |   "
+                f"Adm. {anio_ref}: {admin_usados_anio} (restantes: {'—' if admin_rest_anio is None else admin_rest_anio})"
+            ),
             text_color="#9ca3af"
         ).grid(row=3, column=0, columnspan=2, sticky="w", pady=(4,2))
 
@@ -543,6 +605,7 @@ def construir_dia_administrativo(frame_padre):
             cc_list = [x.strip() for x in cc_raw.split(",") if x.strip()]
             if not to_list:
                 return messagebox.showerror("Correo", "Indica al menos un destinatario en 'Para'.")
+
             gen = datetime.now().strftime("%d-%m-%Y %H:%M")
             text_body = (
                 "Estimado(a), adjuntamos el informe de Permisos y Días Administrativos.\n"
@@ -550,9 +613,14 @@ def construir_dia_administrativo(frame_padre):
                 f"Funcionario : {nombre} ({rut})\n"
                 f"Periodo     : {period_text}\n"
                 f"Registros   : {len(filas)}\n"
+                f"Días admin {anio_ref}: {admin_usados_anio} "
+                f"(restantes: {'—' if admin_rest_anio is None else admin_rest_anio})\n"
                 f"Generado    : {gen}\n"
             )
-            html_body = _html_email_permisos(period_text, nombre or "—", rut or "—", len(filas))
+            html_body = _html_email_permisos(
+                period_text, nombre or "—", rut or "—", len(filas),
+                admin_usados_anio, admin_rest_anio, anio_ref
+            )
             subject   = f"Permisos y Días Administrativos — {nombre or rut} — {period_text}"
 
             ok = _send_pdf_email(to_list, cc_list, subject, text_body, html_body, ruta_pdf)
@@ -565,10 +633,10 @@ def construir_dia_administrativo(frame_padre):
 
         frame.update_idletasks()
         try:
-            w = max(640, dlg.winfo_reqwidth() + 32)
+            w = max(680, dlg.winfo_reqwidth() + 32)
             h = max(260, dlg.winfo_reqheight() + 16)
         except Exception:
-            w, h = 640, 260
+            w, h = 680, 260
         x = frame.winfo_rootx() + (frame.winfo_width() // 2) - (w // 2)
         y = frame.winfo_rooty()  + (frame.winfo_height() // 2) - (h // 2)
         dlg.geometry(f"{w}x{h}+{max(x,0)}+{max(y,0)}")
@@ -602,7 +670,7 @@ def construir_dia_administrativo(frame_padre):
     combo_nombre = ctk.CTkComboBox(fila_nombre, values=primeros_10, width=250)
     combo_nombre.set("Buscar por Nombre")
     combo_nombre.pack(side="left", padx=(0, 5))
-    btn_buscar = ctk.CTkButton(fila_nombre, text="🔍 Buscar", command=lambda: buscar_solicitudes())
+    btn_buscar = ctk.CTkButton(fila_nombre, text="🔍 Buscar")
     btn_buscar.pack(side="left", padx=(5, 0))
 
     # RUT
@@ -610,6 +678,7 @@ def construir_dia_administrativo(frame_padre):
     entry_rut.pack(pady=5)
     entry_rut.bind("<Return>", lambda event: mostrar_vista_previa())
 
+    # Resúmenes (consistentes)
     label_resumen_admin  = ctk.CTkLabel(frame, text="", text_color="green", font=("Arial", 13))
     label_resumen_admin.pack(pady=(0, 5))
     label_resumen_extras = ctk.CTkLabel(frame, text="", text_color="red", font=("Arial", 13))
@@ -928,7 +997,7 @@ def construir_dia_administrativo(frame_padre):
             entry_fecha_hasta.configure(state="normal")
     chk_auto.configure(command=_on_toggle_auto)
 
-    # vista previa
+    # vista previa (CONSISTENTE con cupo y usados anuales)
     def mostrar_vista_previa():
         for w in tabla_preview.winfo_children(): w.destroy()
         selected_ids.clear(); checkbox_vars.clear(); actualizar_boton_eliminar()
@@ -940,25 +1009,29 @@ def construir_dia_administrativo(frame_padre):
             return
 
         anio_actual = datetime.now().year
-        conn = sqlite3.connect("reloj_control.db"); cur = conn.cursor()
-        cur.execute("""
-            SELECT COUNT(*) FROM dias_libres 
-            WHERE rut = ? AND strftime('%Y', fecha) = ? AND motivo = 'Día Administrativo'
-        """, (rut, str(anio_actual)))
-        total_admin = cur.fetchone()[0]
-        MAX_ADMIN_ANUAL = 6
-        color = "green" if total_admin < MAX_ADMIN_ANUAL else ("orange" if total_admin == MAX_ADMIN_ANUAL else "red")
+        cupo = obtener_cupo_admin_para_rut(rut)
+        if cupo is None:
+            cupo = 6  # default coherente
+        admin_usados_anio = contar_admin_anio(rut, anio_actual)
+        color = "green"
+        if admin_usados_anio == cupo:
+            color = "orange"
+        elif admin_usados_anio > cupo:
+            color = "red"
         label_resumen_admin.configure(
-            text=f"📅 Días administrativos solicitados este año: {total_admin} / {MAX_ADMIN_ANUAL} disponibles",
+            text=f"📅 Días administrativos usados este año ({anio_actual}): {admin_usados_anio} / {cupo}",
             text_color=color
         )
 
+        # extras = todos menos 'Día Administrativo'
+        conn = sqlite3.connect("reloj_control.db"); cur = conn.cursor()
         cur.execute("""
             SELECT COUNT(*) FROM dias_libres 
-            WHERE rut = ? AND strftime('%Y', fecha) = ? AND motivo != 'Día Administrativo'
+            WHERE rut = ? AND strftime('%Y', fecha) = ?
+              AND NOT (motivo='Día Administrativo' OR lower(motivo) LIKE '%dia administrativo%' OR lower(motivo) LIKE '%día administrativo%')
         """, (rut, str(anio_actual)))
         total_extras = cur.fetchone()[0]
-        label_resumen_extras.configure(text=f"🧾 Permisos extras este año: {total_extras}")
+        label_resumen_extras.configure(text=f"🧾 Otros permisos este año: {total_extras}")
 
         cur.execute("SELECT id, fecha, motivo FROM dias_libres WHERE rut = ? ORDER BY fecha", (rut,))
         registros = cur.fetchall()
