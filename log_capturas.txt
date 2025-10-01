@@ -120,3 +120,13 @@
 [2025-09-29 17:06:15] Inicio app | BASE=c:\Users\robot\Proyectos\Reloj_Control
 [2025-09-29 17:16:59] Inicio app | BASE=c:\Users\robot\Proyectos\Reloj_Control
 [2025-09-30 15:59:02] Inicio app | BASE=c:\Users\robot\Proyectos\Reloj_Control
+[2025-09-30 19:29:23] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 20:42:10] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 20:44:01] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 21:01:03] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 21:02:52] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 21:04:54] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 21:15:58] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 21:19:33] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 21:33:07] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
+[2025-09-30 22:09:08] Inicio app | BASE=c:\Users\zombie\Documents\GitHub\Reloj_Control
