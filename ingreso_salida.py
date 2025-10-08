@@ -192,10 +192,10 @@ def _rut_valido(r: str) -> bool:
 FACIAL_TOLERANCE = 0.50      # más bajo = más estricto
 DISTANCE_MARGIN  = 0.04
 FRIDAY_FLEX_MINUTES = 30     # margen de “colación” (viernes)
-LATE_AFTER_EXIT_MINUTES = 40 # observación si supera la salida final por 40+ min
+LATE_AFTER_EXIT_MINUTES = 60 # observación si supera la salida final por 60+ min  ✅
 
 # ---------- configuración de extras ----------
-EXTRA_MINUTES_THRESHOLD = 30
+EXTRA_MINUTES_THRESHOLD = 60
 EXTRA_COUNT_ONLY_ABOVE_THRESHOLD = True
 
 def _ensure_list_encodings(obj):
@@ -487,6 +487,9 @@ _extras_ensure_schema()
 
 # ================== UI PRINCIPAL ==================
 def construir_ingreso_salida(frame_padre):
+    # *** FECHA LOCAL DEL DÍA ACTUAL PARA TODA LA VISTA ***
+    HOY = _hoy_iso()  # 'YYYY-MM-DD' (evita UTC en SQLite)
+
     # ---------- Diálogo de EMERGENCIA ----------
     def pedir_emergencia(rut_sugerido="", mensaje="❌ Rostro no verificado. Usa clave de emergencia:"):
         TopLevelCls = getattr(ctk, "CTkToplevel", None) or tk.Toplevel
@@ -588,8 +591,8 @@ def construir_ingreso_salida(frame_padre):
         cursor = conexion.cursor()
         cursor.execute("""
             SELECT hora_ingreso, hora_salida FROM registros
-            WHERE rut = ? AND DATE(fecha) = DATE('now')
-        """, (rut,))
+            WHERE rut = ? AND DATE(fecha) = ?
+        """, (rut, HOY))
         resultado = cursor.fetchone()
         conexion.close()
 
@@ -660,8 +663,8 @@ def construir_ingreso_salida(frame_padre):
 
             if tipo == "ingreso":
                 cursor.execute("""
-                    SELECT hora_ingreso FROM registros WHERE rut = ? AND DATE(fecha) = DATE('now')
-                """, (rut,))
+                    SELECT hora_ingreso FROM registros WHERE rut = ? AND DATE(fecha) = ?
+                """, (rut, HOY))
                 resultado = cursor.fetchone()
                 if resultado:
                     if resultado[0]:
@@ -671,8 +674,8 @@ def construir_ingreso_salida(frame_padre):
                     else:
                         cursor.execute("""
                             UPDATE registros SET hora_ingreso = ?, observacion = ? 
-                            WHERE rut = ? AND DATE(fecha) = DATE('now')
-                        """, (hora_actual, observacion, rut))
+                            WHERE rut = ? AND DATE(fecha) = ?
+                        """, (hora_actual, observacion, rut, HOY))
                         conexion.commit()
                 else:
                     cursor.execute("""
@@ -699,15 +702,15 @@ def construir_ingreso_salida(frame_padre):
                 if flag and not es_f:
                     cursor.execute("""
                         SELECT hora_ingreso, observacion FROM registros 
-                        WHERE rut=? AND DATE(fecha)=DATE('now')
-                    """, (rut,))
+                        WHERE rut=? AND DATE(fecha)=?
+                    """, (rut, HOY))
                     row = cursor.fetchone()
                     hora_ingreso_hhmm = row[0] if row else None
                     hora_oficial = _hora_salida_oficial_por_horario(rut, fecha_iso, hora_ingreso_hhmm)
                     obs_concat = (row[1] + " | " if row and row[1] else "") + (obs_aut or "Salida anticipada autorizada")
 
                     # Doble-check salida ya registrada
-                    cursor.execute("SELECT hora_salida FROM registros WHERE rut=? AND DATE(fecha)=DATE('now')", (rut,))
+                    cursor.execute("SELECT hora_salida FROM registros WHERE rut=? AND DATE(fecha)=?", (rut, HOY))
                     hs = cursor.fetchone()
                     if hs and hs[0]:
                         label_estado.configure(text="⚠️ Ya registraste una salida hoy.", text_color="orange")
@@ -717,8 +720,8 @@ def construir_ingreso_salida(frame_padre):
                     if row:
                         cursor.execute("""
                             UPDATE registros SET hora_salida=?, observacion=? 
-                            WHERE rut=? AND DATE(fecha)=DATE('now')
-                        """, (hora_oficial, obs_concat, rut))
+                            WHERE rut=? AND DATE(fecha)=?
+                        """, (hora_oficial, obs_concat, rut, HOY))
                     else:
                         cursor.execute("""
                             INSERT INTO registros (rut, nombre, fecha, hora_ingreso, hora_salida, observacion)
@@ -741,8 +744,8 @@ def construir_ingreso_salida(frame_padre):
 
                 # Flujo normal (sin panel)
                 cursor.execute("""
-                    SELECT hora_salida FROM registros WHERE rut = ? AND DATE(fecha) = DATE('now')
-                """, (rut,))
+                    SELECT hora_salida FROM registros WHERE rut = ? AND DATE(fecha) = ?
+                """, (rut, HOY))
                 resultado = cursor.fetchone()
                 if resultado and resultado[0]:
                     label_estado.configure(text="⚠️ Ya registraste una salida hoy.", text_color="orange")
@@ -755,8 +758,8 @@ def construir_ingreso_salida(frame_padre):
                 if usar_hora_oficial_salida:
                     cursor.execute("""
                         SELECT hora_ingreso, observacion FROM registros 
-                        WHERE rut=? AND DATE(fecha)=DATE('now')
-                    """, (rut,))
+                        WHERE rut=? AND DATE(fecha)=?
+                    """, (rut, HOY))
                     row = cursor.fetchone()
                     hora_ingreso_hhmm = row[0] if row else None
                     hora_oficial = _hora_salida_oficial_por_horario(rut, fecha_iso, hora_ingreso_hhmm)
@@ -767,8 +770,8 @@ def construir_ingreso_salida(frame_padre):
                 if resultado:
                     cursor.execute("""
                         UPDATE registros SET hora_salida = ?, observacion = ? 
-                        WHERE rut = ? AND DATE(fecha) = DATE('now')
-                    """, (hora_db, observacion, rut))
+                        WHERE rut = ? AND DATE(fecha) = ?
+                    """, (hora_db, observacion, rut, HOY))
                     conexion.commit()
                 else:
                     cursor.execute("""
@@ -783,7 +786,7 @@ def construir_ingreso_salida(frame_padre):
                     try:
                         con2 = sqlite3.connect(DB_PATH)
                         cur2 = con2.cursor()
-                        cur2.execute("SELECT hora_ingreso FROM registros WHERE rut=? AND DATE(fecha)=DATE('now')", (rut,))
+                        cur2.execute("SELECT hora_ingreso FROM registros WHERE rut=? AND DATE(fecha)=?", (rut, HOY))
                         row = cur2.fetchone()
                         con2.close()
                         hora_ingreso_hhmm = row[0] if row and row[0] else None
@@ -883,24 +886,26 @@ def construir_ingreso_salida(frame_padre):
                             )
                             requiere_observacion = True
                         else:
-                            # Salida DESPUÉS de la pactada: observación solo si supera umbral (40 min)
+                            # Salida DESPUÉS o IGUAL a la pactada
                             delta_seg = (hora_actual_dt - ultima_salida_dt).total_seconds()
-                            delta_min = int(delta_seg // 60)
-                            if delta_min >= LATE_AFTER_EXIT_MINUTES:
-                                horas = int(delta_min // 60)
-                                minutos = int(delta_min % 60)
-                                mensaje_motivo = (
-                                    f"⚠️ Estás registrando salida {delta_min} minuto(s) "
-                                    f"después de la hora pactada ({ultima_salida_dt.strftime('%H:%M')}).\n"
-                                    f"🕒 Hora actual: {hora_actual_dt.strftime('%H:%M')}.\n"
-                                    f"⏱ Exceso: {horas:02}:{minutos:02}.\n"
-                                    f"✍️ Por favor, indica el motivo:"
-                                )
-                                requiere_observacion = True
-                            else:
-                                # Entre hora pactada y +40 min → registro directo
+                            delta_min = max(0, int(delta_seg // 60))  # clamp a 0 por seguridad
+
+                            # ✅ Blindaje: si el exceso es menor a 60 minutos, registrar directo SIN pedir observación
+                            if delta_min < LATE_AFTER_EXIT_MINUTES:
                                 registrar_final()
                                 return
+
+                            # Si supera o iguala el umbral → pedir observación
+                            horas = int(delta_min // 60)
+                            minutos = int(delta_min % 60)
+                            mensaje_motivo = (
+                                f"⚠️ Estás registrando salida {delta_min} minuto(s) "
+                                f"después de la hora pactada ({ultima_salida_dt.strftime('%H:%M')}).\n"
+                                f"🕒 Hora actual: {hora_actual_dt.strftime('%H:%M')}.\n"
+                                f"⏱ Exceso: {horas:02}:{minutos:02}.\n"
+                                f"✍️ Por favor, indica el motivo:"
+                            )
+                            requiere_observacion = True
 
                     except Exception:
                         mensaje_motivo = (

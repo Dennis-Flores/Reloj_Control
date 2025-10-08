@@ -6,6 +6,8 @@ import tkinter as tk
 import customtkinter as ctk
 from tkinter import messagebox
 import traceback
+import threading
+from datetime import datetime
 
 from db import crear_bd
 from panel_avanzado import construir_panel_avanzado
@@ -13,6 +15,42 @@ from solicitudes import construir_solicitudes
 from cambio_clave_admin import abrir_cambio_clave
 from dia_administrativo import construir_dia_administrativo
 from resumen_dia import construir_resumen_dia
+
+# ========== Hook global de errores ==========
+LOG_FILE = os.path.join(os.path.expanduser("~"), "Reloj_Control_error.log")
+
+def _log_unhandled(exc_type, exc, tb):
+    """Escribe los errores no controlados en un archivo en la carpeta del usuario."""
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"\n[{datetime.now():%Y-%m-%d %H:%M:%S}] {exc_type.__name__}: {exc}\n")
+            traceback.print_tb(tb, file=f)
+            f.write("\n")
+    except Exception:
+        pass  # nunca fallar aquí
+
+# Excepciones no atrapadas en el hilo principal
+sys.excepthook = _log_unhandled
+
+# Excepciones en otros hilos
+def _thread_hook(args):
+    _log_unhandled(args.exc_type, args.exc_value, args.exc_traceback)
+threading.excepthook = _thread_hook
+
+def _install_tk_exception_hook(widget):
+    """Hace que los errores en callbacks Tk/CTk muestren un popup y se registren en el log."""
+    def _tk_handler(exc_type, exc, tb):
+        _log_unhandled(exc_type, exc, tb)
+        try:
+            messagebox.showerror("Error no controlado", f"{exc_type.__name__}: {exc}")
+        except Exception:
+            pass
+    try:
+        widget.report_callback_exception = _tk_handler
+    except Exception:
+        pass
+# ===========================================
+
 
 # ========== Utilidades de ruta ==========
 def app_path() -> str:
@@ -37,6 +75,9 @@ admin_info = None  # Almacena los datos del administrador logueado
 # ========== Ventana ==========
 app = ctk.CTk()
 app.title("BioAccess/Control de Horarios | www.bioaccess.cl")
+
+# Instalar hook de excepciones para Tk/CTk
+_install_tk_exception_hook(app)
 
 # Tamaño mínimo si se desmaximiza (opcional pero recomendado)
 app.minsize(1200, 700)  # ← NUEVO
@@ -449,4 +490,8 @@ except Exception as e:
     traceback.print_exc()
     messagebox.showerror("Error al cargar Ingreso/Salida", str(e))
 
-app.mainloop()
+# ========== Mainloop con salvaguarda ==========
+try:
+    app.mainloop()
+except Exception as e:
+    _log_unhandled(type(e), e, e.__traceback__)

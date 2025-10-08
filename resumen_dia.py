@@ -1,5 +1,6 @@
 # resumen_dia.py
 import os
+import re
 import ssl
 import smtplib
 import mimetypes
@@ -30,7 +31,7 @@ try:
 except Exception:
     HAS_PDF = False
 
-# ======== SMTP fallback (igual que panel) ========
+# ======== SMTP fallback ========
 SMTP_FALLBACK = {
     "host": "mail.bioaccess.cl",
     "port": 465,
@@ -124,16 +125,124 @@ def _parse_ddmmyyyy(s: str) -> date | None:
     try: return datetime.strptime(s.strip(), "%d/%m/%Y").date()
     except Exception: return None
 def _format_ddmmyyyy(d: date) -> str: return d.strftime("%d/%m/%Y")
+
 def _parse_hora(h: str) -> datetime | None:
-    if not h: return None
+    if not h:
+        return None
+    s = h.strip()
+    m = re.match(r'^(\d{1,2}):(\d{2})(?::(\d{2}))?$', s)
+    if m:
+        hh = int(m.group(1)); mm = int(m.group(2)); ss = int(m.group(3) or 0)
+        if 0 <= hh <= 23 and 0 <= mm <= 59 and 0 <= ss <= 59:
+            return datetime(1900, 1, 1, hh, mm, ss)
+        return None
     for fmt in ("%H:%M:%S", "%H:%M"):
-        try: return datetime.strptime(h.strip(), fmt)
+        try: return datetime.strptime(s, fmt)
         except ValueError: continue
     return None
+
 def _diff_minutes(a: str, b: str) -> int | None:
     ta, tb = _parse_hora(a), _parse_hora(b)
     if not ta or not tb: return None
-    return int((ta - tb).total_seconds() // 60)  # + si a>b
+    return int((ta - tb).total_seconds() // 60)
+
+# ================= Atrasos mensuales =================
+def _table_exists(tabla: str) -> bool:
+    try:
+        con = sqlite3.connect(DB); cur = con.cursor()
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND lower(name)=lower(?)", (tabla,))
+        ok = cur.fetchone() is not None
+        con.close()
+        return ok
+    except Exception:
+        return False
+
+def _month_bounds(fecha: date) -> tuple[date, date]:
+    first = fecha.replace(day=1)
+    if fecha.month == 12:
+        nextm = fecha.replace(year=fecha.year+1, month=1, day=1)
+    else:
+        nextm = fecha.replace(month=fecha.month+1, day=1)
+    last = nextm - timedelta(days=1)
+    return first, last
+
+def _read_atraso_mensual_db(rut: str, fecha: date) -> int | None:
+    if not _table_exists("atrasos_mensuales"):
+        return None
+    per = fecha.strftime("%Y-%m")
+    anio, mes = fecha.year, fecha.month
+
+    con = sqlite3.connect(DB); cur = con.cursor()
+    cur.execute("PRAGMA table_info(atrasos_mensuales)")
+    cols = [c[1].lower() for c in cur.fetchall()]
+    minutos_col = "minutos" if "minutos" in cols else ("total_minutos" if "total_minutos" in cols else None)
+    if not minutos_col:
+        con.close(); return None
+
+    result = None
+    try:
+        if "period" in cols:
+            cur.execute(f"""
+                SELECT {minutos_col} FROM atrasos_mensuales
+                WHERE REPLACE(REPLACE(UPPER(IFNULL(rut,'')),'.',''),'-','')
+                      = REPLACE(REPLACE(UPPER(?),'.',''),'-','')
+                  AND period=?
+                LIMIT 1
+            """, (rut, per))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                result = int(row[0])
+        elif "anio" in cols and "mes" in cols:
+            cur.execute(f"""
+                SELECT {minutos_col} FROM atrasos_mensuales
+                WHERE REPLACE(REPLACE(UPPER(IFNULL(rut,'')),'.',''),'-','')
+                      = REPLACE(REPLACE(UPPER(?),'.',''),'-','')
+                  AND anio=? AND mes=?
+                LIMIT 1
+            """, (rut, anio, mes))
+            row = cur.fetchone()
+            if row and row[0] is not None:
+                result = int(row[0])
+    finally:
+        con.close()
+    return result
+
+def _calc_atraso_mensual_on_the_fly(rut: str, fecha_corte: date) -> int:
+    first, _last = _month_bounds(fecha_corte)
+    total = 0
+    con = sqlite3.connect(DB); cur = con.cursor()
+    try:
+        d = first
+        while d <= fecha_corte:
+            fecha_iso = _date_to_iso(d)
+            cur.execute("""
+                SELECT COALESCE(NULLIF(hora_ingreso,''), 
+                                CASE WHEN lower(IFNULL(tipo,''))='ingreso' THEN IFNULL(hora,'') ELSE '' END)
+                FROM registros
+                WHERE DATE(fecha)=? 
+                  AND REPLACE(REPLACE(UPPER(IFNULL(rut,'')),'.',''),'-','')
+                      = REPLACE(REPLACE(UPPER(?),'.',''),'-','')
+                  AND TRIM(COALESCE(hora_ingreso, CASE WHEN lower(IFNULL(tipo,''))='ingreso' THEN IFNULL(hora,'') ELSE '' END))<>''
+                ORDER BY time(COALESCE(hora_ingreso, hora)) ASC
+                LIMIT 1
+            """, (fecha_iso, rut))
+            r = cur.fetchone()
+            h_real = r[0] if r and r[0] else ""
+            if h_real:
+                h_esp = _expected_ingreso(rut, d, h_real) or ""
+                dm = _diff_minutes(h_real or "", h_esp or "")
+                if dm is not None and dm > TOL_INGRESO_MIN:
+                    total += (dm - TOL_INGRESO_MIN)
+            d += timedelta(days=1)
+    finally:
+        con.close()
+    return total
+
+def _get_atraso_mensual(rut: str, fecha: date) -> int:
+    val = _read_atraso_mensual_db(rut, fecha)
+    if val is not None:
+        return max(0, int(val))
+    return _calc_atraso_mensual_on_the_fly(rut, fecha)
 
 # ================= Consultas =================
 def _fetch_ingresos(fecha_iso: str):
@@ -181,42 +290,106 @@ def _fetch_salidas(fecha_iso: str):
     return rows
 
 def _fetch_observaciones(fecha_iso: str):
+    """
+    Observaciones/permisos del día (registros + dias_libres si existe)
+    """
     con = sqlite3.connect(DB); cur = con.cursor()
-    cur.execute("""
-        WITH base AS (
-          SELECT
-            IFNULL(observacion,'') AS obs,
-            IFNULL(rut,'')        AS rut,
-            IFNULL(nombre,'')     AS nom,
-            IFNULL(hora_ingreso,'') AS hi,
-            IFNULL(hora_salida,'')  AS hs,
-            IFNULL(hora,'')         AS hx,
-            IFNULL(tipo,'')         AS tp
-          FROM registros
-          WHERE DATE(fecha)=?
-        ),
-        rows AS (
-          SELECT
-            COALESCE(NULLIF(hi,''), NULLIF(hs,''), hx, '') AS h,
-            CASE
-              WHEN lower(obs) LIKE '%permiso%' OR lower(tp) LIKE '%permiso%' THEN 'Permiso'
-              ELSE 'Observación'
-            END AS tipo,
-            rut, nom,
-            CASE
-              WHEN TRIM(hi)<>'' THEN 'Ingreso'
-              WHEN TRIM(hs)<>'' THEN 'Salida'
-              ELSE 'Otro'
-            END AS evento,
-            lower(obs) AS obs_l,
-            obs AS obs_txt
-          FROM base
-          WHERE TRIM(obs) <> ''
-        )
-        SELECT h, tipo, rut, nom, evento, obs_l, obs_txt
-        FROM rows
-        ORDER BY CASE WHEN TRIM(h)<>'' THEN time(h) ELSE time('23:59:59') END ASC
-    """, (fecha_iso,))
+    cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND lower(name)='dias_libres'")
+    has_dl = cur.fetchone() is not None
+
+    if has_dl:
+        sql = """
+            WITH base AS (
+              SELECT
+                IFNULL(observacion,'') AS obs,
+                IFNULL(rut,'')        AS rut,
+                IFNULL(nombre,'')     AS nom,
+                IFNULL(hora_ingreso,'') AS hi,
+                IFNULL(hora_salida,'')  AS hs,
+                IFNULL(hora,'')         AS hx,
+                IFNULL(tipo,'')         AS tp
+              FROM registros
+              WHERE DATE(fecha)=?
+            ),
+            rows_reg AS (
+              SELECT
+                COALESCE(NULLIF(hi,''), NULLIF(hs,''), hx, '') AS h,
+                CASE
+                  WHEN lower(tp)  LIKE '%permiso%' OR lower(obs) LIKE '%permiso%' THEN 'Permiso'
+                  ELSE 'Observación'
+                END AS tipo,
+                rut, nom,
+                CASE
+                  WHEN TRIM(hi)<>'' THEN 'Ingreso'
+                  WHEN TRIM(hs)<>'' THEN 'Salida'
+                  ELSE 'Otro'
+                END AS evento,
+                lower(obs) AS obs_l,
+                obs AS obs_txt
+              FROM base
+              WHERE TRIM(obs) <> '' OR lower(tp) LIKE '%permiso%'
+            ),
+            libres AS (
+              SELECT
+                '' AS h,
+                'Permiso' AS tipo,
+                IFNULL(dl.rut,'') AS rut,
+                IFNULL(tr.nombre,'') AS nom,
+                'Permiso' AS evento,
+                lower(IFNULL(dl.motivo,'')) AS obs_l,
+                IFNULL(dl.motivo,'') AS obs_txt
+              FROM dias_libres dl
+              LEFT JOIN trabajadores tr
+                ON REPLACE(REPLACE(UPPER(IFNULL(tr.rut,'')),'.',''),'-','')
+                 = REPLACE(REPLACE(UPPER(IFNULL(dl.rut,'')),'.',''),'-','')
+              WHERE DATE(dl.fecha)=?
+            )
+            SELECT h, tipo, rut, nom, evento, obs_l, obs_txt
+            FROM (
+                SELECT * FROM rows_reg
+                UNION ALL
+                SELECT * FROM libres
+            )
+            ORDER BY CASE WHEN TRIM(h)<>'' THEN time(h) ELSE time('23:59:59') END ASC
+        """
+        cur.execute(sql, (fecha_iso, fecha_iso))
+    else:
+        sql = """
+            WITH base AS (
+              SELECT
+                IFNULL(observacion,'') AS obs,
+                IFNULL(rut,'')        AS rut,
+                IFNULL(nombre,'')     AS nom,
+                IFNULL(hora_ingreso,'') AS hi,
+                IFNULL(hora_salida,'')  AS hs,
+                IFNULL(hora,'')         AS hx,
+                IFNULL(tipo,'')         AS tp
+              FROM registros
+              WHERE DATE(fecha)=?
+            ),
+            rows AS (
+              SELECT
+                COALESCE(NULLIF(hi,''), NULLIF(hs,''), hx, '') AS h,
+                CASE
+                  WHEN lower(tp)  LIKE '%permiso%' OR lower(obs) LIKE '%permiso%' THEN 'Permiso'
+                  ELSE 'Observación'
+                END AS tipo,
+                rut, nom,
+                CASE
+                  WHEN TRIM(hi)<>'' THEN 'Ingreso'
+                  WHEN TRIM(hs)<>'' THEN 'Salida'
+                  ELSE 'Otro'
+                END AS evento,
+                lower(obs) AS obs_l,
+                obs AS obs_txt
+              FROM base
+              WHERE TRIM(obs) <> '' OR lower(tp) LIKE '%permiso%'
+            )
+            SELECT h, tipo, rut, nom, evento, obs_l, obs_txt
+            FROM rows
+            ORDER BY CASE WHEN TRIM(h)<>'' THEN time(h) ELSE time('23:59:59') END ASC
+        """
+        cur.execute(sql, (fecha_iso,))
     rows = cur.fetchall(); con.close()
     return rows
 
@@ -224,12 +397,19 @@ def _fetch_observaciones(fecha_iso: str):
 def _fetch_horarios_dia(rut: str, dia_es: str):
     con = sqlite3.connect(DB); cur = con.cursor()
     cur.execute("""
-        SELECT TRIM(IFNULL(hora_entrada,'')) AS he, TRIM(IFNULL(hora_salida,'')) AS hs
+        SELECT TRIM(IFNULL(hora_entrada,'')) AS he,
+               TRIM(IFNULL(hora_salida ,'')) AS hs
         FROM horarios
-        WHERE rut=? AND dia=?
-          AND TRIM(IFNULL(hora_entrada,'')) <> ''
-          AND TRIM(IFNULL(hora_salida,''))  <> ''
-        ORDER BY time(he) ASC
+        WHERE REPLACE(REPLACE(UPPER(IFNULL(rut,'')),'.',''),'-','')
+              = REPLACE(REPLACE(UPPER(?),'.',''),'-','')
+          AND LOWER(TRIM(IFNULL(dia,''))) = LOWER(TRIM(?))
+        ORDER BY time(
+            CASE
+              WHEN instr(he, ':')>0 THEN
+                printf('%02d:%s', CAST(substr(he,1,instr(he,':')-1) AS INT), substr(he,instr(he,':')+1))
+              ELSE he
+            END
+        ) ASC
     """, (rut, dia_es))
     rows = cur.fetchall(); con.close()
     return rows
@@ -277,105 +457,182 @@ def _setup_tree_styles(parent, base_name="Resumen"):
     style.configure(sb, background="#1f2937", troughcolor="#0b1220", bordercolor="#0b1220",
                     lightcolor="#0b1220", darkcolor="#0b1220", arrowcolor="#E5E7EB")
 
-# ================= PDF del día =================
-def _pdf_resumen_dia(path, fecha_dt: date, ingresos_pdf, salidas_pdf, observs_pdf, resumen_dict):
+# ==================== PDF helpers (brand) ====================
+def _pdf_brand_styles():
+    from reportlab.lib import colors
+    styles = getSampleStyleSheet()
+    pal = {
+        "brand": colors.HexColor("#0b72b9"),
+        "th_bg": colors.HexColor("#1f2937"),
+        "th_fg": colors.HexColor("#f8fafc"),
+        "row_a": colors.HexColor("#f8fafc"),
+        "row_b": colors.HexColor("#eef2f7"),
+        "grid":  colors.HexColor("#cbd5e1"),
+        "ok":    colors.HexColor("#16a34a"),
+        "bad":   colors.HexColor("#ef4444"),
+        "info":  colors.HexColor("#3b82f6"),
+    }
+    if "Header" not in styles:
+        styles.add(ParagraphStyle(name="Header", parent=styles["Title"], fontSize=18, leading=22, alignment=TA_LEFT, textColor=pal["th_fg"]))
+    if "Small" not in styles:
+        styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=10, leading=12))
+    if "Cell" not in styles:
+        styles.add(ParagraphStyle(name="Cell", parent=styles["Normal"], fontSize=9, leading=11))
+    return styles, pal
+
+def _styled_table(data, pal, colWidths=None, zebra=True, head_bold=True, align_right_cols=None, repeat_header=True):
+    tbl = Table(data, colWidths=colWidths, repeatRows=1 if repeat_header else 0)
+    ts = TableStyle([
+        ("BACKGROUND", (0,0), (-1,0), pal["th_bg"]),
+        ("TEXTCOLOR", (0,0), (-1,0), pal["th_fg"]),
+        ("GRID", (0,0), (-1,-1), 0.3, pal["grid"]),
+        ("FONTSIZE", (0,0), (-1,-1), 9),
+        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
+        ("LEFTPADDING", (0,0), (-1,-1), 6),
+        ("RIGHTPADDING", (0,0), (-1,-1), 6),
+        ("TOPPADDING", (0,0), (-1,-1), 4),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 4),
+    ])
+    if head_bold:
+        ts.add("FONTNAME", (0,0), (-1,0), "Helvetica-Bold")
+    if zebra and len(data) > 1:
+        for i in range(1, len(data)):
+            ts.add("BACKGROUND", (0,i), (-1,i), pal["row_a" if i % 2 else "row_b"])
+    if align_right_cols:
+        for ci in align_right_cols:
+            ts.add("ALIGN", (ci,1), (ci,-1), "RIGHT")
+    tbl.setStyle(ts)
+    return tbl
+
+# ================= PDF del día (UNIFICADO) =================
+def _pdf_resumen_dia(path, fecha_dt: date, combinados_pdf, observs_pdf, resumen_dict):
     if not HAS_PDF: raise RuntimeError("ReportLab no está instalado.")
     doc = SimpleDocTemplate(path, pagesize=landscape(A4),
-                            rightMargin=14, leftMargin=14, topMargin=12, bottomMargin=12)
-    styles = getSampleStyleSheet()
-    styles.add(ParagraphStyle(name="Header", parent=styles["Title"], fontSize=18, leading=22, alignment=TA_LEFT))
-    styles.add(ParagraphStyle(name="Small", parent=styles["Normal"], fontSize=10, leading=12))
-    styles.add(ParagraphStyle(name="Cell", parent=styles["Normal"], fontSize=9, leading=11))
-    # Estilo especial para Detalle con envoltura agresiva
-    obs_cell_style = ParagraphStyle(
-        name="ObsCell",
-        parent=styles["Normal"],
-        fontSize=9,
-        leading=11,
-        wordWrap="CJK",  # permite quebrar palabras largas
-    )
+                            rightMargin=28, leftMargin=28, topMargin=18, bottomMargin=18)
+
+    styles, pal = _pdf_brand_styles()
+    obs_cell_style = ParagraphStyle(name="ObsCell", parent=styles["Normal"], fontSize=9, leading=11, wordWrap="CJK")
 
     story = []
-    story.append(Paragraph("Reporte de Asistencia – Resumen Diario", styles["Header"]))
+
+    # Banner
+    banner = Table([[f"Informe de Asistencia de Funcionarios – Resumen Diario"]], colWidths=[720])
+    banner.setStyle(TableStyle([
+        ("BACKGROUND", (0,0), (-1,-1), pal["brand"]),
+        ("TEXTCOLOR", (0,0), (-1,-1), pal["th_fg"]),
+        ("FONTNAME", (0,0), (-1,-1), "Helvetica-Bold"),
+        ("FONTSIZE", (0,0), (-1,-1), 16),
+        ("LEFTPADDING", (0,0), (-1,-1), 10),
+        ("RIGHTPADDING", (0,0), (-1,-1), 10),
+        ("TOPPADDING", (0,0), (-1,-1), 8),
+        ("BOTTOMPADDING", (0,0), (-1,-1), 8),
+    ]))
+    story.append(banner)
+    story.append(Spacer(1, 6))
     story.append(Paragraph(
         f"Período: {fecha_dt.strftime('%d/%m/%Y')} &nbsp;&nbsp;|&nbsp;&nbsp; "
         f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Small"]))
-    story.append(Spacer(1, 6))
+    story.append(Spacer(1, 8))
 
+    # Resumen del día (incluye total atraso del mes)
     intro_rows = [
-        ["Ingresos del día", resumen_dict.get("ing_total", 0)],
-        ["Dentro de rango (+≤5')", resumen_dict.get("ing_ok", 0)],
-        ["Fuera de rango", resumen_dict.get("ing_bad", 0)],
-        ["Con observaciones", resumen_dict.get("obs_distinct", 0)],
-        ["Con cometidos", resumen_dict.get("cometidos", 0)],
+        ["Ingresos totales realizados", resumen_dict.get("ing_total", 0)],
+        ["Salidas totales realizadas", resumen_dict.get("sal_total", 0)],
+        ["Ingresos Correctos", resumen_dict.get("ing_ok", 0)],
+        ["Salidas Correctas", resumen_dict.get("sal_ok", 0)],
+        ["Fuera de rangos Entrada", resumen_dict.get("ing_bad", 0)],
+        ["Fuera de Rangos Salida", resumen_dict.get("sal_bad", 0)],
+        ["Observaciones", resumen_dict.get("obs_distinct", 0)],
+        ["Con Cometidos", resumen_dict.get("cometidos", 0)],
         ["Administrativos", resumen_dict.get("administrativos", 0)],
-        ["Otros", resumen_dict.get("otros", 0)],
+        ["Funcionarios con Licencia", resumen_dict.get("licencias", 0)],
+        ["Atraso acumulado del mes (min) – presentes en el día", resumen_dict.get("atraso_mes_total", 0)],
     ]
-    tbl_intro = Table([["Resumen del día", ""]] + intro_rows, colWidths=[160, 60])
-    tbl_intro.setStyle(TableStyle([
-        ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e2e8f0")),
-        ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-        ("GRID", (0,0), (-1,-1), 0.3, colors.grey),
-        ("ALIGN", (1,1), (1,-1), "RIGHT"),
-        ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-        ("FONTSIZE", (0,0), (-1,-1), 10),
-        ("LEFTPADDING", (0,0), (-1,-1), 6),
-        ("RIGHTPADDING", (0,0), (-1,-1), 6),
-    ]))
-    story.append(tbl_intro); story.append(Spacer(1, 8))
+    tbl_intro = _styled_table([["RESUMEN DEL DÍA", ""]] + intro_rows, pal, colWidths=[360, 80], align_right_cols=[1])
+    story.append(tbl_intro); story.append(Spacer(1, 10))
 
-    def _mk_table(title, headers, rows, status_idx, col_widths=None, wrap_cols=None, wrap_style=None):
+    # --- Tabla Unificada Ingresos + Salidas + Atraso Mes
+    headers = [
+        "Hora Ingreso", "Esperada",
+        "Hora Salida", "Esperada",
+        "Atraso Mes (min)", "RUT", "Nombre",
+        "Estado Ingreso", "Estado Salida"
+    ]
+    data = [headers] + [list(r) for r in combinados_pdf]
+
+    # colWidths reordenados (puedes ajustar a gusto)
+    tbl = _styled_table(
+        data, pal,
+        colWidths=[70,60,60,65,80,80,250,70,70],
+        align_right_cols=[4]   # opcional: alinea a la derecha la columna de minutos
+    )
+
+    
+
+    # Colores de estado + marcar horas reales fuera de rango
+    styl = TableStyle([])
+    # est_in = col 7, est_sa = col 8; horas reales: ingreso 0, salida 2
+    for i, row in enumerate(combinados_pdf, start=1):
+        est_in = (str(row[7]) if len(row) > 7 else "").strip()
+        est_sa = (str(row[8]) if len(row) > 8 else "").strip()
+        if est_in == "✓":
+            styl.add("TEXTCOLOR", (7,i), (7,i), pal["ok"])
+        elif est_in == "✗":
+            styl.add("TEXTCOLOR", (7,i), (7,i), pal["bad"])
+            styl.add("TEXTCOLOR", (0,i), (0,i), pal["bad"])
+        if est_sa == "✓":
+            styl.add("TEXTCOLOR", (8,i), (8,i), pal["ok"])
+        elif est_sa == "✗":
+            styl.add("TEXTCOLOR", (8,i), (8,i), pal["bad"])
+            styl.add("TEXTCOLOR", (2,i), (2,i), pal["bad"])
+
+    tbl.setStyle(styl)
+    story.append(Paragraph("<b>Ingresos, Salidas y Atraso del Mes</b>", styles["Small"]))
+    story.append(tbl); story.append(Spacer(1, 10))
+
+    # --- Observaciones / Permisos
+    def _mk_obs_table(title, headers, rows, status_idx, col_widths=None, wrap_cols=None, wrap_style=None):
         story.append(Paragraph(f"<b>{title}</b>", styles["Small"]))
         data = [list(headers)]
-        # envolver columnas indicadas con Paragraph para permitir salto de línea
         for r in rows:
             rr = list(r)
             if wrap_cols:
                 for ci in wrap_cols:
                     try:
                         txt = rr[ci]
-                        # Escapar HTML y respetar saltos de línea
                         txt = escape(str(txt or "")).replace("\n", "<br/>")
                         rr[ci] = Paragraph(txt, wrap_style or styles["Cell"])
                     except Exception:
                         rr[ci] = Paragraph("", wrap_style or styles["Cell"])
             data.append(rr)
-        tbl = Table(data, repeatRows=1, colWidths=col_widths)
-        styl = [
-            ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#e2e8f0")),
-            ("FONTNAME", (0,0), (-1,0), "Helvetica-Bold"),
-            ("GRID", (0,0), (-1,-1), 0.25, colors.grey),
-            ("VALIGN", (0,1), (-1,-1), "TOP"),     # importante para celdas con múltiples líneas
-            ("FONTSIZE", (0,0), (-1,-1), 9),
-            ("LEFTPADDING", (0,0), (-1,-1), 4),
-            ("RIGHTPADDING", (0,0), (-1,-1), 4),
-        ]
+        tbl2 = _styled_table(data, pal, colWidths=col_widths)
+
+        styl2 = TableStyle([])
         for i, row in enumerate(rows, start=1):
             val = (row[status_idx] or "").strip()
             if val == "✓":
-                styl.append(("TEXTCOLOR", (status_idx, i), (status_idx, i), colors.HexColor("#16a34a")))
+                styl2.add("TEXTCOLOR", (status_idx, i), (status_idx, i), pal["ok"])
             elif val == "✗":
-                styl.append(("TEXTCOLOR", (status_idx, i), (status_idx, i), colors.HexColor("#ef4444")))
-        tbl.setStyle(TableStyle(styl))
-        story.append(tbl); story.append(Spacer(1, 8))
+                styl2.add("TEXTCOLOR", (status_idx, i), (status_idx, i), pal["bad"])
+            elif val == "ℹ":
+                styl2.add("TEXTCOLOR", (status_idx, i), (status_idx, i), pal["info"])
+            if title.lower().startswith("observaciones") and len(row) > 1:
+                try:
+                    ev = str(row[1]).lower()
+                except Exception:
+                    ev = ""
+                if "permiso" in ev:
+                    styl2.add("TEXTCOLOR", (0, i), (status_idx-1, i), pal["info"])
+        tbl2.setStyle(styl2)
+        story.append(tbl2); story.append(Spacer(1, 8))
 
-    # Ingresos / Salidas
-    _mk_table("Ingresos",
-              ["Hora", "Hora esperada", "RUT", "Nombre", "Estado"],
-              ingresos_pdf, status_idx=4)
-
-    _mk_table("Salidas",
-              ["Hora", "Hora esperada", "RUT", "Nombre", "Estado"],
-              salidas_pdf, status_idx=4)
-
-    # Observaciones con "Detalle" (envuelto) y ancho de columna grande
-    _mk_table("Observaciones / Permisos",
-              ["Hora", "Evento", "RUT", "Nombre", "Detalle", "Estado"],
-              observs_pdf,
-              status_idx=5,
-              col_widths=[50, 50, 70, 230, 330, 50],
-              wrap_cols=[4],
-              wrap_style=obs_cell_style)
+    _mk_obs_table("Observaciones / Permisos",
+                  ["Hora", "Evento", "RUT", "Nombre", "Detalle", "Estado"],
+                  observs_pdf,
+                  status_idx=5,
+                  col_widths=[50, 60, 70, 230, 350, 40],
+                  wrap_cols=[4],
+                  wrap_style=obs_cell_style)
 
     doc.build(story)
 
@@ -528,14 +785,14 @@ def construir_resumen_dia(frame_padre):
 
     # ---- INGRESOS ----
     frame_ing = ctk.CTkFrame(body); frame_ing.grid(row=0, column=0, sticky="nsew", padx=(0,6))
-    ctk.CTkLabel(frame_ing, text="Ingresos", font=("Arial", 14, "bold")).pack(pady=(6,4), anchor="w", padx=8)
+    ctk.CTkLabel(frame_ing, text="Ingresos", font=("Arial", 12, "bold")).pack(pady=(6,4), anchor="w", padx=8)
     cols_ing = ("Hora", "Hora esperada", "RUT", "Nombre")
     tv_ing = ttk.Treeview(frame_ing, columns=cols_ing, show="headings", style="Resumen.Treeview",
                           selectmode="browse", height=14)
-    tv_ing.column("Hora", width=90, anchor="center")
-    tv_ing.column("Hora esperada", width=120, anchor="center")
-    tv_ing.column("RUT", width=130, anchor="w")
-    tv_ing.column("Nombre", width=200, anchor="w")
+    tv_ing.column("Hora", width=60, anchor="center")
+    tv_ing.column("Hora esperada", width=90, anchor="center")
+    tv_ing.column("RUT", width=90, anchor="w")
+    tv_ing.column("Nombre", width=270, anchor="w")
     for c in cols_ing: tv_ing.heading(c, text=c)
     y_ing = ttk.Scrollbar(frame_ing, orient="vertical", command=tv_ing.yview, style="Resumen.Vertical.TScrollbar")
     tv_ing.configure(yscrollcommand=y_ing.set); tv_ing.pack(side="left", fill="both", expand=True, padx=(8,0), pady=(0,8))
@@ -578,10 +835,11 @@ def construir_resumen_dia(frame_padre):
     tv_ing.tag_configure("bad", foreground="#ef4444")
     tv_sal.tag_configure("ok", foreground="#16a34a")
     tv_sal.tag_configure("bad", foreground="#ef4444")
+    tv_obs.tag_configure("perm", foreground="#60a5fa", background="#0b2240")
 
     # ---------- lógica -----------
     cache_rows = {"ing": [], "sal": [], "obs": []}
-    last_pdf_payload = {"ing": [], "sal": [], "obs": [], "resume": {}}
+    last_pdf_payload = {"combined": [], "obs": [], "resume": {}, "ing": [], "sal": []}
 
     def _set_header_date():
         d = state["fecha"]
@@ -596,31 +854,63 @@ def construir_resumen_dia(frame_padre):
         term = (state["filtro"] or "").strip().lower()
         d = state["fecha"]
 
+        # ---- Ingresos (todas las marcas) ----
         ing_disp = []
         ing_ok = ing_bad = 0
+        first_ing_por_rut = {}
         for h_real, rut, nombre, h_ing_col in cache_rows["ing"]:
             h_esp = _expected_ingreso(rut, d, h_real)
             dm = _diff_minutes(h_real, h_esp)
-            is_ok = (dm is not None) and (dm <= TOL_INGRESO_MIN)
-            tag = "ok" if is_ok else "bad"
-            if is_ok: ing_ok += 1
-            else: ing_bad += 1
+            is_ok = (dm is not None) and (dm <= TOL_INGRESO_MIN) if h_esp else None
+            tag = "ok" if is_ok else ("bad" if h_esp else None)
+            if tag == "ok": ing_ok += 1
+            elif tag == "bad": ing_bad += 1
             row = (h_real, h_esp or "--:--", rut, nombre)
             ing_disp.append((row, tag))
+            if rut not in first_ing_por_rut:
+                first_ing_por_rut[rut] = {"h_real": h_real, "h_esp": h_esp or "", "nombre": nombre,
+                                          "estado": ("✓" if tag=="ok" else ("✗" if tag=="bad" else "—"))}
 
+        # ---- Salidas (todas las marcas) ----
         sal_disp = []
         sal_ok = sal_bad = 0
+        last_sal_por_rut = {}
         for h_real, rut, nombre, h_ing_col in cache_rows["sal"]:
             h_esp = _expected_salida(rut, d, h_real, h_ing_col)
             dm = _diff_minutes(h_real, h_esp)
-            is_ok = (dm is not None) and (0 <= dm <= TOL_SALIDA_MAX_MIN)
-            tag = "ok" if is_ok else "bad"
-            if is_ok: sal_ok += 1
-            else: sal_bad += 1
+            is_ok = (dm is not None) and (0 <= dm <= TOL_SALIDA_MAX_MIN) if h_esp else None
+            tag = "ok" if is_ok else ("bad" if h_esp else None)
+            if tag == "ok": sal_ok += 1
+            elif tag == "bad": sal_bad += 1
             row = (h_real, h_esp or "--:--", rut, nombre)
             sal_disp.append((row, tag))
+            last_sal_por_rut[rut] = {"h_real": h_real, "h_esp": h_esp or "", "nombre": nombre,
+                                     "estado": ("✓" if tag=="ok" else ("✗" if tag=="bad" else "—"))}
 
-        obs_disp = [((h or "--:--", ev, r, n, txt), None) for (h, _t, r, n, ev, _ol, txt) in cache_rows["obs"]]
+        # ---- Observaciones / Permisos ----
+        def motivo_perm(obs_l: str) -> str | None:
+            if not obs_l: return None
+            if "licenc" in obs_l or "médic" in obs_l or "medic" in obs_l: return "Licencia médica"
+            if "cometid" in obs_l: return "Cometido de servicio"
+            if "administr" in obs_l: return "Permiso administrativo"
+            if "permiso" in obs_l: return "Permiso"
+            return None
+
+        perm_by_rut = {}
+        otros = []
+        for (h, tipo, rut, nom, evento, ol, txt) in cache_rows["obs"]:
+            motivo = motivo_perm(ol or "")
+            if motivo or (tipo or "").lower().startswith("permiso"):
+                if not motivo: motivo = "Permiso"
+                if rut not in perm_by_rut:
+                    perm_by_rut[rut] = (motivo, rut, nom)
+            else:
+                otros.append((h, evento, rut, nom, txt))
+
+        # --- UI lists
+        obs_disp = [((h or "--:--", ev, r, n, txt or ""), None) for (h, ev, r, n, txt) in otros]
+        for (motivo, rut, nom) in perm_by_rut.values():
+            obs_disp.append((("--:--", "Permiso", rut, nom, motivo), "perm"))
         obs_count = len(obs_disp)
 
         def match(values): return (term in " ".join([str(v or "") for v in values]).lower()) if term else True
@@ -630,44 +920,83 @@ def construir_resumen_dia(frame_padre):
 
         _clear_all()
         for i, (vals, tag) in enumerate(ing_f):
-            tv_ing.insert("", "end", values=vals, tags=(("even" if i%2==0 else "odd"), tag))
+            tags = ("even" if i%2==0 else "odd",)
+            if tag: tags += (tag,)
+            tv_ing.insert("", "end", values=vals, tags=tags)
         for i, (vals, tag) in enumerate(sal_f):
-            tv_sal.insert("", "end", values=vals, tags=(("even" if i%2==0 else "odd"), tag))
-        for i, (vals, _tag) in enumerate(obs_f):
-            tv_obs.insert("", "end", values=vals, tags=("even" if i%2==0 else "odd",))
+            tags = ("even" if i%2==0 else "odd",)
+            if tag: tags += (tag,)
+            tv_sal.insert("", "end", values=vals, tags=tags)
+        for i, (vals, tag) in enumerate(obs_f):
+            tags = ("even" if i%2==0 else "odd",)
+            if tag: tags += (tag,)
+            tv_obs.insert("", "end", values=vals, tags=tags)
 
         lbl_ing.configure(text=f"Ingresos: {len(ing_f)}")
         lbl_sal.configure(text=f"Salidas: {len(sal_f)}")
         lbl_obs.configure(text=f"Obs/Permisos: {len(obs_f)}")
 
-        # payload para PDF
-        last_pdf_payload["ing"] = [(a,b,c,d, "✓" if t=="ok" else "✗") for (a,b,c,d), t in ing_disp]
-        last_pdf_payload["sal"] = [(a,b,c,d, "✓" if t=="ok" else "✗") for (a,b,c,d), t in sal_disp]
+        # ---- Payloads “clásicos”
+        last_pdf_payload["ing"] = [(a,b,c,d, "✓" if t=="ok" else ("✗" if t=="bad" else "—")) for (a,b,c,d), t in ing_disp]
+        last_pdf_payload["sal"] = [(a,b,c,d, "✓" if t=="ok" else ("✗" if t=="bad" else "—")) for (a,b,c,d), t in sal_disp]
 
-        # obs estado + texto
+        # ---- Observaciones PDF + conteos
         obs_pdf = []
-        cometidos = administrativos = otros = 0
-        for (h, tipo, rut, nom, evento, ol, txt) in cache_rows["obs"]:
+        cometidos = administrativos = licencias = 0; otros_cnt = 0
+        for (h, ev, r, n, txt) in otros:
             estado = "—"
-            if evento == "Ingreso":
-                esp = _expected_ingreso(rut, d, h or "08:00")
+            if ev == "Ingreso":
+                esp = _expected_ingreso(r, d, h or "08:00")
                 dm = _diff_minutes(h or "", esp or "")
-                estado = "✓" if (dm is not None and dm <= TOL_INGRESO_MIN) else "✗"
-            elif evento == "Salida":
-                esp = _expected_salida(rut, d, h or "18:00", None)
+                estado = "✓" if (dm is not None and dm <= TOL_INGRESO_MIN and esp) else ("✗" if esp else "—")
+            elif ev == "Salida":
+                esp = _expected_salida(r, d, h or "18:00", None)
                 dm = _diff_minutes(h or "", esp or "")
-                estado = "✓" if (dm is not None and 0 <= dm <= TOL_SALIDA_MAX_MIN) else "✗"
-            obs_pdf.append((h or "--:--", evento, rut, nom, txt or "", estado))
-
-            if "cometid" in ol: cometidos += 1
-            elif "administr" in ol: administrativos += 1
-            else: otros += 1
+                estado = "✓" if (dm is not None and 0 <= dm <= TOL_SALIDA_MAX_MIN and esp) else ("✗" if esp else "—")
+            obs_pdf.append((h or "--:--", ev, r, n, txt or "", estado))
+            otros_cnt += 1
+        for (motivo, rut, nom) in perm_by_rut.values():
+            obs_pdf.append(("--:--", "Permiso", rut, nom, motivo, "ℹ"))
+            ml = motivo.lower()
+            if "licencia" in ml: licencias += 1
+            elif "cometido" in ml: cometidos += 1
+            elif "administr" in ml: administrativos += 1
         last_pdf_payload["obs"] = obs_pdf
+
+        # ---- COMBINADO por RUT (con Atraso Mes)
+        ruts = set(first_ing_por_rut.keys()) | set(last_sal_por_rut.keys())
+        atraso_map = {rut: _get_atraso_mensual(rut, d) for rut in ruts}
+        total_atraso_mes_sel = 0
+
+        combined_rows = []
+        for rut in sorted(ruts):
+            ing = first_ing_por_rut.get(rut, {})
+            sal = last_sal_por_rut.get(rut, {})
+            h_in_r = ing.get("h_real", "") or "--:--"
+            h_in_e = (ing.get("h_esp", "") or "") or "--:--"
+            h_sa_r = sal.get("h_real", "") or "--:--"
+            h_sa_e = (sal.get("h_esp", "") or "") or "--:--"
+            nombre = ing.get("nombre") or sal.get("nombre") or ""
+            est_in = ing.get("estado", "—")
+            est_sa = sal.get("estado", "—")
+            atr_mes = max(0, int(atraso_map.get(rut, 0)))
+            total_atraso_mes_sel += atr_mes
+
+            combined_rows.append([h_in_r, h_in_e, h_sa_r, h_sa_e, atr_mes, rut, nombre, est_in, est_sa])
+
+
+        last_pdf_payload["combined"] = combined_rows
+
+        # ---- Resumen
         last_pdf_payload["resume"] = {
             "ing_total": len(ing_disp),
+            "sal_total": len(sal_disp),
             "ing_ok": ing_ok, "ing_bad": ing_bad,
+            "sal_ok": sal_ok, "sal_bad": sal_bad,
             "obs_distinct": obs_count,
-            "cometidos": cometidos, "administrativos": administrativos, "otros": otros,
+            "cometidos": cometidos, "administrativos": administrativos,
+            "licencias": licencias, "otros": otros_cnt,
+            "atraso_mes_total": total_atraso_mes_sel
         }
 
     def _load_day():
@@ -677,7 +1006,7 @@ def construir_resumen_dia(frame_padre):
         cache_rows["obs"] = _fetch_observaciones(fecha_iso)
         _apply_filter()
 
-    # Handlers
+    # Handlers y binds
     def _debounced_filter(_=None):
         if state["after_id"]:
             try: root.after_cancel(state["after_id"])
@@ -705,8 +1034,13 @@ def construir_resumen_dia(frame_padre):
             carpeta = os.path.join(os.path.expanduser("~"), "Downloads")
             os.makedirs(carpeta, exist_ok=True)
             out = os.path.join(carpeta, f"resumen_{state['fecha'].strftime('%Y%m%d')}.pdf")
-            _pdf_resumen_dia(out, state["fecha"], last_pdf_payload["ing"], last_pdf_payload["sal"],
-                             last_pdf_payload["obs"], last_pdf_payload["resume"])
+            _pdf_resumen_dia(
+                out,
+                state["fecha"],
+                last_pdf_payload["combined"],
+                last_pdf_payload["obs"],
+                last_pdf_payload["resume"]
+            )
             tk.messagebox.showinfo("PDF", f"PDF guardado en Descargas:\n{os.path.basename(out)}")
             try: os.startfile(out)
             except Exception: pass
@@ -745,8 +1079,13 @@ def construir_resumen_dia(frame_padre):
             tmp = tempfile.NamedTemporaryFile(prefix="resumen_", suffix=".pdf", delete=False)
             tmp.close()
             try:
-                _pdf_resumen_dia(tmp.name, state["fecha"], last_pdf_payload["ing"], last_pdf_payload["sal"],
-                                 last_pdf_payload["obs"], last_pdf_payload["resume"])
+                _pdf_resumen_dia(
+                    tmp.name,
+                    state["fecha"],
+                    last_pdf_payload["combined"],
+                    last_pdf_payload["obs"],
+                    last_pdf_payload["resume"]
+                )
                 _smtp_send(to, [], subject, body, html_body=None, attachment_path=tmp.name)
                 tk.messagebox.showinfo("Enviar", "Correo enviado correctamente.")
                 win.destroy()
@@ -797,9 +1136,5 @@ def construir_resumen_dia(frame_padre):
     tv_sal.bind("<Double-1>", _dbl_sal)
 
     # Carga inicial
-    def _set_header_date():  # redefine para cierre sobre outer
-        d = state["fecha"]
-        lbl_dia.configure(text=f"{DAYS_ES[d.weekday()]} {_format_ddmmyyyy(d)}")
-        entry_fecha.delete(0, "end"); entry_fecha.insert(0, _format_ddmmyyyy(d))
     _set_header_date()
     _load_day()

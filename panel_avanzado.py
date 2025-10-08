@@ -1,10 +1,75 @@
 import os
 import sys
+import ssl
+import smtplib
+import mimetypes
+import tempfile
 import customtkinter as ctk
 import sqlite3
 from tkinter import messagebox, ttk
 import importlib.util
 import importlib
+from email.message import EmailMessage
+
+# ====== Resumen Global: constantes / helpers ======
+TOL_INGRESO_MIN = 5        # para tardanzas (misma regla que usas a diario)
+_DAYS_ES = ['Lunes','Martes','Miércoles','Jueves','Viernes','Sábado','Domingo']
+
+def _fmt_rut_norm(s: str) -> str:
+    return (s or "").upper().replace(".","").replace("-","").strip()
+
+def _parse_hhmm(h: str):
+    from datetime import datetime
+    if not h: return None
+    h = h.strip()
+    for fmt in ("%H:%M:%S","%H:%M"):
+        try: return datetime.strptime(h, fmt)
+        except Exception: pass
+    return None
+
+def _diff_min(a: str, b: str) -> int | None:
+    ta, tb = _parse_hhmm(a), _parse_hhmm(b)
+    if not ta or not tb: return None
+    return int((ta - tb).total_seconds() // 60)
+
+def _fetch_horarios_dia_glob(con, rut: str, dia_es: str):
+    cur = con.cursor()
+    cur.execute("""
+        SELECT TRIM(IFNULL(hora_entrada,'')), TRIM(IFNULL(hora_salida,''))
+        FROM horarios
+        WHERE REPLACE(REPLACE(UPPER(IFNULL(rut,'')),'.',''),'-','')
+              = REPLACE(REPLACE(UPPER(?),'.',''),'-','')
+          AND LOWER(TRIM(IFNULL(dia,''))) = LOWER(TRIM(?))
+          AND TRIM(IFNULL(hora_entrada,'')) <> ''
+          AND TRIM(IFNULL(hora_salida ,'')) <> ''
+        ORDER BY time(hora_entrada) ASC
+    """, (rut, dia_es))
+    return cur.fetchall()
+
+def _expected_ingreso_glob(con, rut: str, fecha_iso: str, hora_real: str) -> str:
+    import datetime as _dt
+    d = _dt.datetime.strptime(fecha_iso, "%Y-%m-%d").date()
+    dia = _DAYS_ES[d.weekday()]
+    bloques = _fetch_horarios_dia_glob(con, rut, dia)
+    if not bloques: return ""
+    t = _parse_hhmm(hora_real) or _parse_hhmm(bloques[0][0])
+    best_he, best_diff = None, None
+    for he, _ in bloques:
+        th = _parse_hhmm(he)
+        if not th: continue
+        diff = abs((t - th).total_seconds())
+        if best_diff is None or diff < best_diff:
+            best_he, best_diff = he, diff
+    return best_he or bloques[0][0]
+
+def _label_perm(motivo_raw: str) -> str:
+    s = (motivo_raw or "").lower()
+    if "licenc" in s: return "Licencia médica"
+    if "cometid" in s: return "Cometido de servicio"
+    if "admin" in s or "día administrativo" in s or "dia administrativo" in s: return "Permiso administrativo"
+    if "defunci" in s: return "Permiso por defunción"
+    if "permiso" in s: return "Permiso"
+    return "Otro permiso"
 
 # --- Rutas/BD ---
 def _app_path():
@@ -12,6 +77,94 @@ def _app_path():
            else os.path.dirname(os.path.abspath(__file__))
 
 DB_PATH = os.path.join(_app_path(), "reloj_control.db")
+
+# ======== SMTP (igual a tu resumen diario) ========
+SMTP_FALLBACK = {
+    "host": "mail.bioaccess.cl",
+    "port": 465,
+    "user": "documentos_bd@bioaccess.cl",
+    "password": "documentos@2025",
+    "use_tls": False,
+    "use_ssl": True,
+    "remitente": "documentos_bd@bioaccess.cl",
+}
+
+def _smtp_load_config():
+    cfg = {}
+    try:
+        con = sqlite3.connect(DB_PATH); cur = con.cursor()
+        try:
+            cur.execute("SELECT host, port, user, password, use_tls, use_ssl, remitente FROM smtp_config LIMIT 1")
+            row = cur.fetchone()
+            if row:
+                cfg = {
+                    "host": row[0],
+                    "port": int(row[1]) if row[1] is not None else 0,
+                    "user": row[2],
+                    "password": row[3],
+                    "use_tls": str(row[4]).lower() in ("1","true","t","yes","y"),
+                    "use_ssl": str(row[5]).lower() in ("1","true","t","yes","y"),
+                    "remitente": row[6] or row[2]
+                }
+                con.close(); return cfg
+        except Exception:
+            pass
+        try:
+            cur.execute("SELECT clave, valor FROM parametros_smtp")
+            rows = cur.fetchall()
+            if rows:
+                mapa = {k: v for k, v in rows}
+                cfg = {
+                    "host": mapa.get("host"),
+                    "port": int(mapa.get("port", "0")),
+                    "user": mapa.get("user"),
+                    "password": mapa.get("password"),
+                    "use_tls": str(mapa.get("use_tls", "true")).lower() in ("1","true","t","yes","y"),
+                    "use_ssl": str(mapa.get("use_ssl", "false")).lower() in ("1","true","t","yes","y"),
+                    "remitente": mapa.get("remitente", mapa.get("user"))
+                }
+                con.close(); return cfg
+        except Exception:
+            pass
+        con.close()
+    except Exception:
+        pass
+    return None
+
+def _smtp_send(to_list, cc_list, subject, body_text, html_body=None, attachment_path=None):
+    cfg = _smtp_load_config() or SMTP_FALLBACK
+    msg = EmailMessage()
+    remitente = cfg.get("remitente") or cfg.get("user")
+    msg["From"] = remitente
+    msg["To"] = ", ".join(to_list) if to_list else ""
+    if cc_list: msg["Cc"] = ", ".join(cc_list)
+    msg["Subject"] = subject or "Resumen Global"
+    msg.set_content(body_text or "")
+    if html_body: msg.add_alternative(html_body, subtype="html")
+    if attachment_path and os.path.exists(attachment_path):
+        with open(attachment_path, "rb") as f:
+            data = f.read()
+        mime, _ = mimetypes.guess_type(attachment_path)
+        maintype, subtype = (mime.split("/",1) if mime else ("application","octet-stream"))
+        msg.add_attachment(data, maintype=maintype, subtype=subtype, filename=os.path.basename(attachment_path))
+
+    host = cfg["host"]; port = cfg.get("port") or (465 if cfg.get("use_ssl") else 587)
+    user = cfg.get("user"); password = cfg.get("password")
+    use_ssl = cfg.get("use_ssl"); use_tls = cfg.get("use_tls")
+
+    if use_ssl:
+        context = ssl.create_default_context()
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=30) as server:
+            if user and password: server.login(user, password)
+            server.send_message(msg)
+    else:
+        with smtplib.SMTP(host, port, timeout=30) as server:
+            server.ehlo()
+            if use_tls:
+                context = ssl.create_default_context()
+                server.starttls(context=context); server.ehlo()
+            if user and password: server.login(user, password)
+            server.send_message(msg)
 
 # --- Feriados opcional ---
 try:
@@ -58,7 +211,6 @@ def _lift_and_focus(win, parent=None):
     for fn in (win.lift, win.focus_force, win.update):
         try: fn()
         except Exception: pass
-    # topmost temporal para garantizar primer plano
     try:
         win.attributes("-topmost", True)
         win.after(250, lambda: win.attributes("-topmost", False))
@@ -84,7 +236,7 @@ def _iso_to_humano(iso: str) -> str:
     except Exception:
         return ""
 
-# ---------- Estilo oscuro para ttk.Treeview (coherente con el resto) ----------
+# ---------- Estilo oscuro para ttk.Treeview ----------
 def _style_dark_treeview():
     style = ttk.Style()
     try:
@@ -449,7 +601,6 @@ def _abrir_gestor_feriados(parent):
 
     win = ctk.CTkToplevel(parent)
     win.title("Gestor de Feriados")
-    # Más ancho y un poco más alto
     win.geometry("900x560")
     win.minsize(860, 520)
 
@@ -460,13 +611,11 @@ def _abrir_gestor_feriados(parent):
     entry_buscar = ctk.CTkEntry(top, width=260, placeholder_text="fecha o nombre")
     entry_buscar.pack(side="left", padx=(6,10))
 
-    # Botones (Cerrar a la derecha)
     btn_close = ctk.CTkButton(top, text="Cerrar", width=110, fg_color="#4b5563", command=win.destroy)
     btn_del   = ctk.CTkButton(top, text="Eliminar", width=110, fg_color="#e53935")
     btn_edit  = ctk.CTkButton(top, text="Editar", width=110, fg_color="#1e88e5")
     btn_new   = ctk.CTkButton(top, text="Nuevo", width=110, fg_color="#2e7d32",
                               command=lambda: (_abrir_dialogo_feriado_manual(win), _refresh_after()))
-    # Empaquetar en orden para que "Cerrar" quede totalmente a la derecha
     btn_close.pack(side="right", padx=4)
     btn_new.pack(side="right", padx=4)
     btn_edit.pack(side="right", padx=4)
@@ -475,7 +624,6 @@ def _abrir_gestor_feriados(parent):
     mid = ctk.CTkFrame(win)
     mid.pack(fill="both", expand=True, padx=12, pady=(0, 12))
 
-    # Treeview ttk con estilo oscuro
     tree = ttk.Treeview(mid, columns=("fecha","nombre","irren"), show="headings", height=16, style=style_name)
     tree.pack(fill="both", expand=True)
     tree.heading("fecha", text="Fecha")
@@ -485,7 +633,6 @@ def _abrir_gestor_feriados(parent):
     tree.column("nombre", width=540, anchor="w")
     tree.column("irren", width=120, anchor="center")
 
-    # Scrollbar vertical
     vs = ttk.Scrollbar(mid, orient="vertical", command=tree.yview)
     tree.configure(yscrollcommand=vs.set)
     vs.place(relx=1.0, rely=0, relheight=1.0, anchor="ne")
@@ -542,17 +689,479 @@ def _abrir_gestor_feriados(parent):
     _center_on_parent(win, parent)
     _lift_and_focus(win, parent)
 
+def _abrir_resumen_global(parent):
+    """
+    Resumen global con rango de fechas: tardanzas, sin salida, observaciones
+    y permisos/licencias (desde dias_libres). Exporta PDF con gráficos si hay matplotlib.
+    """
+    import datetime as _dt
+    # reportlab opcional
+    try:
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+        from reportlab.lib.styles import getSampleStyleSheet
+        HAS_PDF = True
+    except Exception:
+        HAS_PDF = False
+
+    # matplotlib opcional (para gráficos en PDF)
+    try:
+        import matplotlib.pyplot as _plt
+        HAS_MPL = True
+    except Exception:
+        HAS_MPL = False
+
+    style_name = _style_dark_treeview()
+
+    win = ctk.CTkToplevel(parent)
+    win.title("Resumen Global")
+    # abrir maximizada (Windows / Linux)
+    try:
+        win.state('zoomed')
+    except Exception:
+        try: win.attributes('-zoomed', True)
+        except Exception: pass
+    win.minsize(1000, 620)
+
+    # ------- Top: rango de fechas y acciones
+    top = ctk.CTkFrame(win); top.pack(fill="x", padx=12, pady=(12,6))
+
+    ctk.CTkLabel(top, text="Desde (YYYY-MM-DD):").pack(side="left")
+    e_desde = ctk.CTkEntry(top, width=140); e_desde.pack(side="left", padx=(6,4))
+    b_cal_d = ctk.CTkButton(top, text="📅", width=36); b_cal_d.pack(side="left", padx=(0,10))
+
+    ctk.CTkLabel(top, text="Hasta (YYYY-MM-DD):").pack(side="left")
+    e_hasta = ctk.CTkEntry(top, width=140); e_hasta.pack(side="left", padx=(6,4))
+    b_cal_h = ctk.CTkButton(top, text="📅", width=36); b_cal_h.pack(side="left", padx=(0,10))
+
+    # Rápidos
+    quick = ctk.CTkComboBox(top, width=180,
+                             values=["Últimos 7 días","Últimos 30 días","Este mes","Mes pasado","Este año","Año pasado","Rango personalizado"])
+    quick.pack(side="left", padx=(10,10)); quick.set("Últimos 30 días")
+
+    b_calc = ctk.CTkButton(top, text="Calcular", width=110, fg_color="#1e88e5")
+    b_pdf  = ctk.CTkButton(top, text="Exportar PDF", width=130, fg_color="#0f766e")
+    b_send = ctk.CTkButton(top, text="Enviar", width=110, fg_color="#2563eb")
+    b_close= ctk.CTkButton(top, text="Cerrar", width=110, fg_color="#64748b", command=win.destroy)
+    b_close.pack(side="right", padx=4)
+    b_send.pack(side="right", padx=4)
+    b_pdf.pack(side="right", padx=4)
+    b_calc.pack(side="right", padx=4)
+
+    # Fechas por defecto (últimos 30 días)
+    hoy = _dt.date.today()
+    e_hasta.insert(0, hoy.strftime("%Y-%m-%d"))
+    e_desde.insert(0, (hoy - _dt.timedelta(days=30)).strftime("%Y-%m-%d"))
+
+    # Calendarios
+    b_cal_d.configure(command=lambda: _open_calendar_popup(win, e_desde.get().strip(), lambda iso: (e_desde.delete(0,'end'), e_desde.insert(0, iso))))
+    b_cal_h.configure(command=lambda: _open_calendar_popup(win, e_hasta.get().strip(), lambda iso: (e_hasta.delete(0,'end'), e_hasta.insert(0, iso))))
+
+    # ------- Resumen numérico
+    resume = ctk.CTkFrame(win); resume.pack(fill="x", padx=12, pady=(0,6))
+    lbl_r = ctk.CTkLabel(resume, text="", font=("Segoe UI", 13))
+    lbl_r.pack(anchor="w", padx=6, pady=6)
+
+    # ------- Notebook con tablas
+    nb = ttk.Notebook(win); nb.pack(fill="both", expand=True, padx=12, pady=(0,12))
+
+    # Tab Tardanzas
+    tab_t = ctk.CTkFrame(nb); nb.add(tab_t, text="Tardanzas")
+    frame_top = ctk.CTkFrame(tab_t); frame_top.pack(fill="both", expand=True, padx=8, pady=8)
+    tv_top = ttk.Treeview(frame_top, columns=("rut","nombre","casos","min_tot","min_prom"), show="headings", height=10, style=style_name)
+    for c,t,a,w in (("rut","RUT","w",140),("nombre","Nombre","w",360),("casos","Casos","center",80),
+                    ("min_tot","Min. acumulados","center",130),("min_prom","Promedio min.","center",120)):
+        tv_top.heading(c, text=t); tv_top.column(c, anchor=a, width=w)
+    vs1 = ttk.Scrollbar(frame_top, orient="vertical", command=tv_top.yview); tv_top.configure(yscrollcommand=vs1.set)
+    tv_top.pack(side="left", fill="both", expand=True); vs1.pack(side="left", fill="y", padx=(2,0))
+
+    frame_dia = ctk.CTkFrame(tab_t); frame_dia.pack(fill="both", expand=True, padx=8, pady=(0,8))
+    tv_dia = ttk.Treeview(frame_dia, columns=("fecha","casos"), show="headings", height=8, style=style_name)
+    tv_dia.heading("fecha", text="Fecha"); tv_dia.column("fecha", width=140, anchor="center")
+    tv_dia.heading("casos", text="Tardanzas"); tv_dia.column("casos", width=120, anchor="center")
+    vs2 = ttk.Scrollbar(frame_dia, orient="vertical", command=tv_dia.yview); tv_dia.configure(yscrollcommand=vs2.set)
+    tv_dia.pack(side="left", fill="both", expand=True); vs2.pack(side="left", fill="y", padx=(2,0))
+
+    # Tab Permisos/Licencias
+    tab_p = ctk.CTkFrame(nb); nb.add(tab_p, text="Permisos / Licencias")
+    tv_perm = ttk.Treeview(tab_p, columns=("fecha","rut","nombre","motivo"), show="headings", height=16, style=style_name)
+    for c,t,a,w in (("fecha","Fecha","center",120),("rut","RUT","w",140),("nombre","Nombre","w",360),("motivo","Motivo","w",360)):
+        tv_perm.heading(c, text=t); tv_perm.column(c, anchor=a, width=w)
+    vs3 = ttk.Scrollbar(tab_p, orient="vertical", command=tv_perm.yview); tv_perm.configure(yscrollcommand=vs3.set)
+    tv_perm.pack(side="left", fill="both", expand=True, padx=8, pady=8); vs3.pack(side="left", fill="y", padx=(2,0))
+    lbl_perm = ctk.CTkLabel(tab_p, text=""); lbl_perm.pack(anchor="e", padx=12, pady=(0,8))
+
+    # Tab Sin salida
+    tab_s = ctk.CTkFrame(nb); nb.add(tab_s, text="Ingresos sin salida")
+    tv_nos = ttk.Treeview(tab_s, columns=("fecha","rut","nombre"), show="headings", height=18, style=style_name)
+    for c,t,a,w in (("fecha","Fecha","center",120),("rut","RUT","w",160),("nombre","Nombre","w",520)):
+        tv_nos.heading(c, text=t); tv_nos.column(c, anchor=a, width=w)
+    vs4 = ttk.Scrollbar(tab_s, orient="vertical", command=tv_nos.yview); tv_nos.configure(yscrollcommand=vs4.set)
+    tv_nos.pack(side="left", fill="both", expand=True, padx=8, pady=8); vs4.pack(side="left", fill="y", padx=(2,0))
+
+    # Tab Observaciones (diarias)
+    tab_o = ctk.CTkFrame(nb); nb.add(tab_o, text="Observaciones (Registros)")
+    tv_obs = ttk.Treeview(tab_o, columns=("fecha","rut","nombre","texto"), show="headings", height=16, style=style_name)
+    for c,t,a,w in (("fecha","Fecha","center",120),("rut","RUT","w",160),("nombre","Nombre","w",320),("texto","Texto","w",420)):
+        tv_obs.heading(c, text=t); tv_obs.column(c, anchor=a, width=w)
+    vs5 = ttk.Scrollbar(tab_o, orient="vertical", command=tv_obs.yview); tv_obs.configure(yscrollcommand=vs5.set)
+    tv_obs.pack(side="left", fill="both", expand=True, padx=8, pady=8); vs5.pack(side="left", fill="y", padx=(2,0))
+
+    # ---------- lógica ----------
+    stats_cache = {}
+
+    def _aplicar_quick():
+        base = _dt.date.today()
+        sel = (quick.get() or "").lower()
+        if "7" in sel:
+            d = base - _dt.timedelta(days=7)
+        elif "30" in sel:
+            d = base - _dt.timedelta(days=30)
+        elif sel.startswith("este mes"):
+            d = base.replace(day=1)
+        elif sel.startswith("mes pasado"):
+            first_this = base.replace(day=1)
+            last_prev = first_this - _dt.timedelta(days=1)
+            d = last_prev.replace(day=1); base = last_prev
+        elif sel.startswith("este año"):
+            d = base.replace(month=1, day=1)
+        elif sel.startswith("año pasado"):
+            d = base.replace(year=base.year-1, month=1, day=1)
+            base = base.replace(year=base.year-1, month=12, day=31)
+        else:
+            return
+        e_desde.delete(0,'end'); e_desde.insert(0, d.strftime("%Y-%m-%d"))
+        e_hasta.delete(0,'end'); e_hasta.insert(0, base.strftime("%Y-%m-%d"))
+
+    quick.bind("<<ComboboxSelected>>", lambda e: _aplicar_quick())
+
+    def _calc():
+        for tv in (tv_top, tv_dia, tv_perm, tv_nos, tv_obs):
+            for iid in tv.get_children(): tv.delete(iid)
+
+        f1, f2 = e_desde.get().strip(), e_hasta.get().strip()
+        try:
+            d1 = _dt.datetime.strptime(f1, "%Y-%m-%d").date()
+            d2 = _dt.datetime.strptime(f2, "%Y-%m-%d").date()
+            if d1 > d2: d1, d2 = d2, d1
+        except Exception:
+            messagebox.showerror("Fechas", "Usa formato YYYY-MM-DD."); return
+
+        con = sqlite3.connect(DB_PATH); cur = con.cursor()
+
+        # ------- INGRESOS: tardanzas
+        cur.execute("""
+            SELECT DATE(fecha) AS f, IFNULL(rut,''), IFNULL(nombre,''),
+                   COALESCE(NULLIF(hora_ingreso,''), CASE WHEN lower(IFNULL(tipo,''))='ingreso' THEN IFNULL(hora,'') ELSE '' END) AS h_real
+            FROM registros
+            WHERE DATE(fecha) BETWEEN DATE(?) AND DATE(?)
+              AND TRIM(COALESCE(hora_ingreso, CASE WHEN lower(IFNULL(tipo,''))='ingreso' THEN IFNULL(hora,'') ELSE '' END))<>''
+            ORDER BY DATE(fecha) ASC
+        """, (f1, f2))
+        ingresos = cur.fetchall()
+
+        tard_by_person = {}
+        tard_by_day = {}
+        total_ing = ok_ing = 0
+        sum_min_atraso = 0
+
+        for f, rut, nom, h_real in ingresos:
+            he = _expected_ingreso_glob(con, rut, f, h_real)
+            dm = _diff_min(h_real or "", he or "")
+            total_ing += 1
+            if he and dm is not None and dm > TOL_INGRESO_MIN:
+                info = tard_by_person.setdefault(rut, {"nombre":nom, "casos":0, "min_tot":0})
+                info["casos"] += 1
+                info["min_tot"] += max(0, dm)
+                tard_by_day[f] = tard_by_day.get(f, 0) + 1
+                sum_min_atraso += max(0, dm)
+            else:
+                ok_ing += 1
+
+        top_list = []
+        for rut, d in tard_by_person.items():
+            prom = (d["min_tot"] / d["casos"]) if d["casos"] else 0
+            top_list.append((rut, d["nombre"], d["casos"], d["min_tot"], round(prom,1)))
+        top_list.sort(key=lambda x: (-x[2], -x[3], x[1]))
+
+        # ------- SIN SALIDA
+        cur.execute("""
+            SELECT DATE(fecha), IFNULL(rut,''), IFNULL(nombre,'')
+            FROM registros
+            WHERE DATE(fecha) BETWEEN DATE(?) AND DATE(?)
+              AND TRIM(IFNULL(hora_ingreso,'')) <> ''
+              AND (hora_salida IS NULL OR TRIM(hora_salida)='')
+        """, (f1, f2))
+        sin_sal = cur.fetchall()
+
+        # ------- OBSERVACIONES (de registros)
+        cur.execute("""
+            SELECT DATE(fecha), IFNULL(rut,''), IFNULL(nombre,''), IFNULL(observacion,'')
+            FROM registros
+            WHERE DATE(fecha) BETWEEN DATE(?) AND DATE(?)
+              AND TRIM(IFNULL(observacion,'')) <> ''
+            ORDER BY DATE(fecha) ASC
+        """, (f1, f2))
+        obs_rows = cur.fetchall()
+
+        # ------- PERMISOS/LICENCIAS (dias_libres)
+        cur.execute("SELECT name FROM sqlite_master WHERE type='table' AND lower(name)='dias_libres'")
+        has_dl = cur.fetchone() is not None
+        permisos = []
+        per_by_mot = {}
+        if has_dl:
+            cur.execute("""
+                SELECT DATE(dl.fecha), IFNULL(dl.rut,''), IFNULL(t.nombre,''), IFNULL(dl.motivo,'')
+                FROM dias_libres dl
+                LEFT JOIN trabajadores t
+                  ON REPLACE(REPLACE(UPPER(IFNULL(t.rut,'')),'.',''),'-','')
+                   = REPLACE(REPLACE(UPPER(IFNULL(dl.rut,'')),'.',''),'-','')
+                WHERE DATE(dl.fecha) BETWEEN DATE(?) AND DATE(?)
+                ORDER BY DATE(dl.fecha) ASC
+            """, (f1, f2))
+            for f, rut, nom, mot in cur.fetchall():
+                motivo = _label_perm(mot)
+                permisos.append((f, rut, nom, motivo))
+                per_by_mot[motivo] = per_by_mot.get(motivo, 0) + 1
+
+        con.close()
+
+        # ----- Resumen numérico
+        tard_total = sum(v[2] for v in top_list)
+        prom_atraso = round((sum_min_atraso / tard_total), 1) if tard_total else 0
+        txt = (f"Período: {f1} → {f2}   |   Ingresos: {total_ing}  "
+               f"| En rango: {ok_ing}  | Tardanzas: {tard_total}  (prom. atraso {prom_atraso} min)   "
+               f"| Obs.reg.: {len(obs_rows)}  | Sin salida: {len(sin_sal)}  | Permisos/licencias: {len(permisos)}")
+        lbl_r.configure(text=txt)
+
+        # ----- llenar tablas
+        for item in top_list[:100]:
+            tv_top.insert("", "end", values=item)
+        for f, c in sorted(tard_by_day.items()):
+            tv_dia.insert("", "end", values=(f, c))
+        for f, r, n, m in permisos:
+            tv_perm.insert("", "end", values=(f, r, n, m))
+        lbl_perm.configure(text=" | ".join([f"{k}: {v}" for k,v in sorted(per_by_mot.items())]) or "—")
+        for f, r, n in sin_sal:
+            tv_nos.insert("", "end", values=(f, r, n))
+        for f, r, n, t in obs_rows:
+            tv_obs.insert("", "end", values=(f, r, n, t))
+
+        # cache para PDF
+        stats_cache.clear()
+        stats_cache.update({
+            "desde": f1, "hasta": f2,
+            "resumen_txt": txt,
+            "top_tard": top_list,
+            "tard_day": sorted(tard_by_day.items()),
+            "permisos": permisos,
+            "permisos_mot": per_by_mot,
+            "sin_salida": sin_sal,
+            "obs_rows": obs_rows,
+            "ing_total": total_ing, "ing_ok": ok_ing, "tard_total": tard_total, "prom_atraso": prom_atraso
+        })
+
+    def _build_pdf_to(out_path: str):
+        if not stats_cache:
+            raise RuntimeError("Primero calcula el resumen.")
+        # gráficos opcionales (PNG)
+        chart_paths = []
+        try:
+            if HAS_MPL and stats_cache["top_tard"]:
+                top10 = stats_cache["top_tard"][:10]
+                labels = [x[1][:20] for x in top10]
+                vals   = [x[2] for x in top10]
+                import matplotlib.pyplot as _plt
+                _plt.figure()
+                _plt.bar(labels, vals)
+                _plt.xticks(rotation=45, ha="right")
+                _plt.title("Top 10 – Tardanzas (casos)")
+                _plt.tight_layout()
+                p1 = tempfile.mkstemp(prefix="chart_top_tard_", suffix=".png")[1]
+                _plt.savefig(p1, dpi=160); _plt.close(); chart_paths.append(p1)
+            if HAS_MPL and stats_cache["permisos_mot"]:
+                labels = list(stats_cache["permisos_mot"].keys())
+                vals   = [stats_cache["permisos_mot"][k] for k in labels]
+                import matplotlib.pyplot as _plt
+                _plt.figure()
+                _plt.bar(labels, vals)
+                _plt.xticks(rotation=30, ha="right")
+                _plt.title("Permisos/Licencias por motivo")
+                _plt.tight_layout()
+                p2 = tempfile.mkstemp(prefix="chart_permisos_", suffix=".png")[1]
+                _plt.savefig(p2, dpi=160); _plt.close(); chart_paths.append(p2)
+        except Exception:
+            chart_paths = []
+
+        # PDF
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib import colors
+        from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Image
+        from reportlab.lib.styles import getSampleStyleSheet
+
+        doc = SimpleDocTemplate(out_path, pagesize=landscape(A4), rightMargin=18, leftMargin=18, topMargin=14, bottomMargin=14)
+        styles = getSampleStyleSheet()
+        h = styles["Heading1"]; h.fontSize=18
+        small = styles["Normal"]; small.fontSize=9
+        body = []
+
+        body.append(Paragraph("Reporte de Asistencia – Resumen Global", h))
+        body.append(Paragraph(stats_cache["resumen_txt"], small))
+        body.append(Spacer(1, 8))
+
+        resumen_rows = [
+            ["Ingresos", stats_cache["ing_total"]],
+            ["En rango (≤5')", stats_cache["ing_ok"]],
+            ["Tardanzas (casos)", stats_cache["tard_total"]],
+            ["Prom. atraso (min)", stats_cache["prom_atraso"]],
+            ["Observaciones (registros)", len(stats_cache["obs_rows"])],
+            ["Ingresos sin salida", len(stats_cache["sin_salida"])],
+            ["Permisos/Licencias", len(stats_cache["permisos"])]
+        ]
+        tbl = Table([["Resumen",""]] + resumen_rows, colWidths=[180, 70])
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND",(0,0),(-1,0), colors.HexColor("#e2e8f0")),
+            ("FONTNAME",(0,0),(-1,0), "Helvetica-Bold"),
+            ("GRID",(0,0),(-1,-1), 0.3, colors.grey),
+            ("ALIGN",(1,1),(1,-1), "RIGHT"),
+            ("FONTSIZE",(0,0),(-1,-1), 10),
+            ("VALIGN",(0,0),(-1,-1), "MIDDLE"),
+        ]))
+        body.append(tbl); body.append(Spacer(1,10))
+
+        top = stats_cache["top_tard"][:20]
+        if top:
+            data = [["RUT","Nombre","Casos","Min. acumulados","Promedio min."]] + [list(x) for x in top]
+            t = Table(data, colWidths=[120, 240, 60, 90, 90])
+            t.setStyle(TableStyle([
+                ("BACKGROUND",(0,0),(-1,0), colors.HexColor("#e2e8f0")),
+                ("FONTNAME",(0,0),(-1,0), "Helvetica-Bold"),
+                ("GRID",(0,0),(-1,-1), 0.25, colors.grey),
+                ("ALIGN",(2,1),(4,-1), "CENTER"),
+                ("FONTSIZE",(0,0),(-1,-1), 9),
+            ]))
+            body.append(Paragraph("<b>Top Tardanzas (primeros 20)</b>", small)); body.append(t); body.append(Spacer(1,8))
+
+        per = stats_cache["permisos"][:60]
+        if per:
+            data = [["Fecha","RUT","Nombre","Motivo"]] + [list(x) for x in per]
+            t = Table(data, colWidths=[70, 120, 220, 220])
+            t.setStyle(TableStyle([
+                ("BACKGROUND",(0,0),(-1,0), colors.HexColor("#e2e8f0")),
+                ("FONTNAME",(0,0),(-1,0), "Helvetica-Bold"),
+                ("GRID",(0,0),(-1,-1), 0.25, colors.grey),
+                ("FONTSIZE",(0,0),(-1,-1), 9),
+                ("TEXTCOLOR",(0,1),(-1,-1), colors.HexColor("#3b82f6")),
+            ]))
+            body.append(Paragraph("<b>Permisos / Licencias</b>", small)); body.append(t); body.append(Spacer(1,8))
+
+        for p in chart_paths:
+            try:
+                body.append(Image(p, width=420, height=260)); body.append(Spacer(1,8))
+            except Exception:
+                pass
+
+        doc.build(body)
+
+        # limpia temporales
+        for p in chart_paths:
+            try: os.remove(p)
+            except Exception: pass
+
+        return out_path
+
+    def _export_pdf():
+        if not HAS_PDF:
+            messagebox.showwarning("PDF", "No está disponible ReportLab. Instálalo con: pip install reportlab")
+            return
+        if not stats_cache:
+            messagebox.showinfo("PDF", "Primero calcula el resumen."); return
+        try:
+            out_dir = os.path.join(os.path.expanduser("~"), "Downloads")
+            os.makedirs(out_dir, exist_ok=True)
+            out_path = os.path.join(out_dir, f"resumen_global_{stats_cache['desde']}_{stats_cache['hasta']}.pdf")
+            _build_pdf_to(out_path)
+            messagebox.showinfo("PDF", f"PDF generado en Descargas:\n{os.path.basename(out_path)}")
+            try: os.startfile(out_path)
+            except Exception: pass
+        except Exception as e:
+            messagebox.showerror("PDF", f"No se pudo generar el PDF:\n{e}")
+
+    def _enviar_pdf():
+        if not HAS_PDF:
+            messagebox.showwarning("PDF", "No está disponible ReportLab. Instálalo con: pip install reportlab")
+            return
+        if not stats_cache:
+            messagebox.showinfo("Enviar", "Primero calcula el resumen."); return
+
+        win_mail = ctk.CTkToplevel(win); win_mail.title("Enviar Resumen Global")
+        try:
+            win_mail.resizable(False, False); win_mail.transient(win); win_mail.grab_set()
+        except Exception:
+            pass
+        cont = ctk.CTkFrame(win_mail); cont.pack(padx=14, pady=14)
+        ctk.CTkLabel(cont, text="Para:").grid(row=0, column=0, sticky="e", padx=(0,6))
+        ent_to = ctk.CTkEntry(cont, width=380); ent_to.grid(row=0, column=1, pady=4); ent_to.insert(0, "destinatario@empresa.cl")
+        ctk.CTkLabel(cont, text="Asunto:").grid(row=1, column=0, sticky="e", padx=(0,6))
+        ent_sub = ctk.CTkEntry(cont, width=380); ent_sub.grid(row=1, column=1, pady=4)
+        ent_sub.insert(0, f"Resumen Global – {stats_cache['desde']} a {stats_cache['hasta']}")
+        ctk.CTkLabel(cont, text="Mensaje:").grid(row=2, column=0, sticky="ne", padx=(0,6))
+        TextBox = getattr(ctk, "CTkTextbox", None)
+        if TextBox:
+            tb = TextBox(cont, width=380, height=130); tb.grid(row=2, column=1, pady=4)
+            tb.insert("1.0", "Estimado(a):\n\nAdjunto el Resumen Global de asistencia.\n\nSaludos.")
+        else:
+            import tkinter as tk
+            tb = tk.Text(cont, width=48, height=7); tb.grid(row=2, column=1, pady=4)
+            tb.insert("1.0", "Estimado(a):\n\nAdjunto el Resumen Global de asistencia.\n\nSaludos.")
+
+        def _do_send():
+            to = [p.strip() for p in ent_to.get().replace(",", ";").split(";") if p.strip()]
+            if not to:
+                messagebox.showwarning("Enviar", "Ingresa al menos un destinatario."); return
+            subject = ent_sub.get().strip() or "Resumen Global"
+            body = tb.get("1.0", "end").strip()
+
+            tmp = tempfile.NamedTemporaryFile(prefix="resumen_global_", suffix=".pdf", delete=False)
+            tmp.close()
+            try:
+                _build_pdf_to(tmp.name)
+                _smtp_send(to, [], subject, body, html_body=None, attachment_path=tmp.name)
+                messagebox.showinfo("Enviar", "Correo enviado correctamente.")
+                win_mail.destroy()
+            except Exception as e:
+                messagebox.showerror("Enviar", f"No fue posible enviar el correo:\n{e}")
+            finally:
+                try: os.remove(tmp.name)
+                except Exception: pass
+
+        btns = ctk.CTkFrame(cont, fg_color="transparent"); btns.grid(row=3, column=0, columnspan=2, pady=(10,0))
+        ctk.CTkButton(btns, text="Cancelar", fg_color="#6b7280", width=120, command=win_mail.destroy).pack(side="left", padx=6)
+        ctk.CTkButton(btns, text="Enviar", fg_color="#22c55e", width=140, command=_do_send).pack(side="left", padx=6)
+
+        _center_on_parent(win_mail, win)
+        _lift_and_focus(win_mail, win)
+
+    b_calc.configure(command=_calc)
+    b_pdf.configure(command=_export_pdf)
+    b_send.configure(command=_enviar_pdf)
+
+    # Autocalcular al abrir (últimos 30 días)
+    win.after(150, _calc)
+
+    _center_on_parent(win, parent)
+    _lift_and_focus(win, parent)
+
 # --- Import robusto (packaged + dev) ---
 def _load_runtime_module(mod_name: str):
     """
     1) Intenta import normal (sirve en el .exe si se agregó --hidden-import).
     2) Si falla, carga el archivo .py desde la carpeta junto al .py/.exe (modo dev).
     """
-    # 1) paquete / .exe
     try:
         return importlib.import_module(mod_name)
     except Exception as e_primary:
-        # 2) fallback a .py en disco (desarrollo)
         base = _app_path()
         path = os.path.join(base, f"{mod_name}.py")
         try:
@@ -656,6 +1265,13 @@ def construir_panel_avanzado(frame_padre):
         frame_padre, width=340, fg_color="#1f6aa5",
         text="Asistencia Diaria (Matriz)",
         command=lambda: _abrir_asistencia_diaria(frame_padre)
+    ).pack(pady=8)
+
+    # Resumen global
+    ctk.CTkButton(
+        frame_padre, width=340, fg_color="#0b72b9",
+        text="Resumen Global",
+        command=lambda: _abrir_resumen_global(frame_padre)
     ).pack(pady=8)
 
 def mostrar_confirmacion_panel(parent, titulo, mensaje, funcion_accion, observacion_default=""):
